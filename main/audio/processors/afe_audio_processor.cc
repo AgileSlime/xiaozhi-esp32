@@ -1,9 +1,19 @@
 #include "afe_audio_processor.h"
 #include <esp_log.h>
+#include <esp_heap_caps.h>
 
 #define PROCESSOR_RUNNING 0x01
 
 #define TAG "AfeAudioProcessor"
+
+// 内部 SRAM 余量是这个板上最容易踩的坑：AFE/AEC 要从片上 RAM 分配，
+// 一旦不够，表现不是"崩溃"而是 TLS 握手失败、MQTT 断连，看起来像网络问题。
+static void LogInternalRam(const char* stage) {
+    ESP_LOGI(TAG, "[RAM] %s 内部空闲=%u 最大块=%u PSRAM空闲=%u", stage,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
 
 AfeAudioProcessor::AfeAudioProcessor()
     : afe_data_(nullptr) {
@@ -65,7 +75,12 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
 #endif
 
     afe_iface_ = esp_afe_handle_from_config(afe_config);
+    LogInternalRam("对话AFE创建前");
     afe_data_ = afe_iface_->create_from_config(afe_config);
+    if (afe_data_ == nullptr) {
+        ESP_LOGE(TAG, "对话AFE创建失败：内部 RAM 不足（需要约 30-40KB 片上 RAM）");
+    }
+    LogInternalRam("对话AFE创建后");
     
     xTaskCreate([](void* arg) {
         auto this_ = (AfeAudioProcessor*)arg;

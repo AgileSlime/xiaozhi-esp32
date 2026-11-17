@@ -21,7 +21,9 @@
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/idf_additions.h>
 #include <esp_log.h>
+#include <esp_heap_caps.h>
 
 #include "application.h"
 #include "assets/lang_config.h"
@@ -55,7 +57,10 @@ void CustomLcdDisplay::StartDataUpdateTask() {
 
     // 栈从 16KB 下调到 8KB，给音频/MQTT 留更多 SRAM 余量
     // 优先级保持较低，避免与语音收发实时链路抢占 CPU
-    xTaskCreate(DataUpdateTask, "ui_refresh_task", 8192, this, 2, &update_task_handle_);
+    // 进一步：整个栈放到 PSRAM。这个任务只做 UI 刷新，不进中断、不碰 DMA，
+    // 8KB 内部 RAM 让给语音前端更划算（AFE 的两个实例才是真正吃内部 RAM 的大户）。
+    xTaskCreateWithCaps(DataUpdateTask, "ui_refresh_task", 8192, this, 2,
+                        &update_task_handle_, MALLOC_CAP_SPIRAM);
 }
 
 void CustomLcdDisplay::DataUpdateTask(void *arg) {
@@ -102,6 +107,7 @@ void CustomLcdDisplay::DataUpdateTask(void *arg) {
             if (self->time_label_) lv_label_set_text(self->time_label_, time_buf);
             if (self->music_time_label_) lv_label_set_text(self->music_time_label_, time_buf);
             if (self->memo_time_label_) lv_label_set_text(self->memo_time_label_, time_buf);
+            if (self->chat_overlay_time_) lv_label_set_text(self->chat_overlay_time_, time_buf);
 
             // 日期合成一行（时间卡只有 158×102，拆成"星期 + 日号"两块摆不下）
             static const char *weeks_cn[] = {"周日", "周一", "周二", "周三", "周四", "周五", "周六"};
@@ -303,11 +309,27 @@ void CustomLcdDisplay::DataUpdateTask(void *arg) {
         // 内部有状态去重，重复调用不会引起重绘
         self->UpdateHomeBottomCard(static_cast<int>(ds));
 
+        // ===== 对话浮层：聆听时浮起，空闲 12 秒后收起 =====
+        // 三页版式都塞不下对话记录，所以做成覆盖层；这里只管"什么时候收"。
+        // 工具跳页（放歌 / 翻目录）已经把浮层收掉了，这里不再抢，
+        // 否则用户刚看到播放器页就又被打回对话。
+        if (ds == kDeviceStateConnecting || ds == kDeviceStateListening) {
+            self->SetChatOverlayVisible(true);
+        } else if (ds == kDeviceStateIdle && self->chat_overlay_visible_) {
+            const uint32_t hide_at = self->chat_hide_at_ms_;
+            if (hide_at != 0 && now_ms >= hide_at) {
+                self->SetChatOverlayVisible(false);
+            }
+        }
+
         // ===== 隔天自动换图 + 首次加载失败重试 =====
         {
             const int today = timeinfo.tm_yday;
             const bool need_load = (self->last_photo_check_day_ >= 0 && today != self->last_photo_check_day_);
-            const bool never_loaded = (HomePhoto::GetInstance().CurrentIndex() < 0);
+            // 网页上传的那张图 index 恒为 -1，如果不排除，会每分钟被判成"没加载过"重画一次，
+            // 1-bit 屏上就是每分钟闪一下。
+            const bool never_loaded = (HomePhoto::GetInstance().CurrentIndex() < 0) &&
+                                      !HomePhoto::GetInstance().HasOverride();
 
             if (need_load || (never_loaded && minute_changed)) {
                 self->last_photo_check_day_ = today;

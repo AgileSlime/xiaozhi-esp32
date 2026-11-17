@@ -32,6 +32,8 @@ bool ReminderManager::Start(uint32_t stack_size, UBaseType_t priority) {
     if (task_handle_ != nullptr) {
         return true;
     }
+    // 注意：栈必须留在内部 RAM。这个任务到点后会写 NVS 删除已响的备忘，
+    // 而 NVS 写 Flash 期间缓存是关闭的，PSRAM 里的栈不可访问（spi_flash 里有 assert）。
     BaseType_t created = xTaskCreate(TaskEntry, "reminder_task", stack_size, this, priority, &task_handle_);
     if (created != pdPASS) {
         task_handle_ = nullptr;

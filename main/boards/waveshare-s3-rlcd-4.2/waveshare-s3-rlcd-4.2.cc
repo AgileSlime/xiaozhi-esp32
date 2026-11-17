@@ -22,6 +22,7 @@
 #include "managers/clock_service.h"
 #include "managers/reminder_manager.h"
 #include "managers/music_library.h"
+#include "managers/music_stream.h"
 #include "managers/photo_loader.h"
 #include "managers/photo_web_server.h"
 
@@ -405,13 +406,18 @@ private:
             [this](const PropertyList&) -> ReturnValue {
                 auto& web = PhotoWebServer::GetInstance();
                 if (!web.Start()) {
-                    return std::string("图片上传服务启动失败，请确认 SD 卡已插好");
+                    return std::string("图片上传服务启动失败，稍后再试");
+                }
+                // 上传服务一开就切回主页：手机上选完图，抬头就能看到照片位变了
+                if (display_) {
+                    display_->NotifyUserActivity();
+                    display_->SwitchToWeatherPage();
                 }
                 const std::string url = web.GetUrl();
                 if (url.empty()) {
                     return std::string("上传服务已开启，但设备还没连上 WiFi；联网后再问我一次地址");
                 }
-                return "图片上传已开启：" + url + " ，手机浏览器打开这个地址就能传图";
+                return "图片上传已开启：" + url + " ，手机浏览器打开这个地址就能换图";
             });
 
         mcp_server.AddTool("self.photo.url",
@@ -706,6 +712,98 @@ private:
                 return std::string("正在播放: ") + title;
             });
 
+        // ===== 在线点播（网易云中转，纯流媒体）=====
+        // 设备不直接连网易云：登录态、直链时效、接口签名全在局域网那台中转机上解决，
+        // 固件只认 tools/netease-relay/relay.py 的约定接口。
+        mcp_server.AddTool("self.music.play_song",
+            "Search a song on the internet and start streaming it. This is the tool for any "
+            "'放首歌 / 我想听 X / 来一首 X' request when the song is not on the SD card.\n"
+            "Use when user says: '放首晴天', '我想听周杰伦的歌', '来点轻音乐', 'play some music'.\n"
+            "Args:\n"
+            "  `keyword`: song name, optionally with artist, e.g. '晴天 周杰伦'\n"
+            "It returns the song title when playback starts, or the reason when it cannot.",
+            PropertyList({
+                Property("keyword", kPropertyTypeString)
+            }),
+            [](const PropertyList& properties) -> ReturnValue {
+                std::string keyword;
+                try { keyword = properties["keyword"].value<std::string>(); } catch (...) { keyword = ""; }
+                if (keyword.empty()) {
+                    return std::string("没说要听什么歌");
+                }
+
+                auto resolved = MusicStream::GetInstance().Play(keyword);
+                if (!resolved.ok) {
+                    return std::string("没放成：") + resolved.reason;
+                }
+
+                auto& app = Application::GetInstance();
+                if (!app.PlayMusicFromUrl(resolved.url, resolved.song.title,
+                                          resolved.song.artist, resolved.lyric)) {
+                    return std::string("找到歌了，但播放没启动（刚播过同一首会这样，隔几秒再说一次）");
+                }
+                return "正在播放《" + resolved.song.title + "》— " + resolved.song.artist;
+            });
+
+        mcp_server.AddTool("self.music.server",
+            "Get or set the streaming relay server address. The relay is the PC/NAS running "
+            "tools/netease-relay/relay.py; without it online songs cannot be played.\n"
+            "Use when user says: '音乐服务器设为 192.168.1.10:8800', '设置音乐服务器', '音乐服务器地址'.\n"
+            "Args:\n"
+            "  `address`: host or host:port (default port 8800). Leave empty to just report the current one.\n"
+            "  `check`: true = also verify the relay answers",
+            PropertyList({
+                Property("address", kPropertyTypeString, std::string("")),
+                Property("check", kPropertyTypeBoolean, false)
+            }),
+            [](const PropertyList& properties) -> ReturnValue {
+                std::string address;
+                bool check = false;
+                try { address = properties["address"].value<std::string>(); } catch (...) { address = ""; }
+                try { check = properties["check"].value<bool>(); } catch (...) { check = false; }
+
+                auto& stream = MusicStream::GetInstance();
+                if (!address.empty()) {
+                    // 没写端口就补默认的 8800（中转脚本的默认端口）
+                    if (address.find("://") == std::string::npos &&
+                        address.find(':') == std::string::npos) {
+                        address += ":8800";
+                    }
+                    stream.SetBase(address);
+                }
+
+                if (!stream.Configured()) {
+                    return std::string("还没设置音乐服务器。在你常开的电脑上跑 tools/netease-relay/relay.py，"
+                                       "然后跟我说「音乐服务器设为 <那台电脑的IP>:8800」");
+                }
+
+                if (!check && address.empty()) {
+                    return "当前音乐服务器：" + stream.Base();
+                }
+
+                bool logged_in = false;
+                std::string err;
+                if (!stream.Health(&logged_in, &err)) {
+                    return "音乐服务器已设为 " + stream.Base() + "，但连不上：" + err;
+                }
+                return "音乐服务器 " + stream.Base() +
+                       (logged_in ? " 正常，已登录网易云" : " 正常，但没有配置 cookie（只能放免费歌）");
+            });
+
+        // ===== 对话记录 =====
+        mcp_server.AddTool("self.chat.history",
+            "Show the recent conversation (what the user said and what you answered) on screen.\n"
+            "Use when user says: '看看聊天记录', '刚才说了什么', '对话记录', 'chat history'",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                if (!display_) {
+                    return std::string("屏幕还没准备好");
+                }
+                display_->NotifyUserActivity();
+                display_->SetChatOverlayVisible(true);
+                return std::string("最近几轮对话已经显示在屏幕上了");
+            });
+
         // ===== 语音播放控制：播放/暂停、上下一首、快进 =====
         // 屏幕没有触摸，这几个是唯一入口，所以每个都要能"只靠一句话"跑通。
         mcp_server.AddTool("self.music.pause",
@@ -830,11 +928,18 @@ private:
 
         // 网页上传图片后立刻刷新主页，不用重启设备
         PhotoWebServer::GetInstance().SetUploadedCallback([this](const std::string& path) {
-            auto& photo = HomePhoto::GetInstance();
-            photo.Rescan();
             if (display_ == nullptr) {
                 return;
             }
+            // "ram:upload" = 一次性图片，已经在内存里抖动好了，直接重新摊到照片位。
+            // 不走 Rescan：没有写 SD 卡，目录扫描反而会把这次上传覆盖掉。
+            if (path == "ram:upload") {
+                display_->SwitchToWeatherPage();
+                display_->LoadHomePhoto(-1);
+                return;
+            }
+            auto& photo = HomePhoto::GetInstance();
+            photo.Rescan();
             const int idx = photo.IndexOf(path);
             display_->LoadHomePhoto(idx >= 0 ? idx : -1);
         });

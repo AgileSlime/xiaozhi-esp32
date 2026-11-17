@@ -400,6 +400,10 @@ void CustomLcdDisplay::RefreshMemoPage() {
 void CustomLcdDisplay::SwitchToMemoPage() {
     DisplayLockGuard lock(this);
 
+    // "打开备忘录/翻页"是要看结果的动作：收起对话浮层，把目录页让出来
+    tool_jumped_this_turn_ = true;
+    SetChatOverlayVisibleInternal(false);
+
     // 先刷新再显示：避免"页面切过来先闪一下旧数据"
     RefreshMemoPageInternal();
 

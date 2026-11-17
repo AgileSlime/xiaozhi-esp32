@@ -1,6 +1,7 @@
 #include "afe_wake_word.h"
 #include "audio_service.h"
 #include <esp_log.h>
+#include <esp_heap_caps.h>
 #include <sstream>
 
 #define DETECTION_RUNNING_EVENT 1
@@ -78,7 +79,13 @@ bool AfeWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) {
     afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
     
     afe_iface_ = esp_afe_handle_from_config(afe_config);
+    ESP_LOGI(TAG, "[RAM] 唤醒词AFE创建前 内部空闲=%u 最大块=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     afe_data_ = afe_iface_->create_from_config(afe_config);
+    ESP_LOGI(TAG, "[RAM] 唤醒词AFE创建后 内部空闲=%u 最大块=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 
     xTaskCreate([](void* arg) {
         auto this_ = (AfeWakeWord*)arg;

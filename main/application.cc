@@ -19,6 +19,9 @@
 #include <arpa/inet.h>
 #include <font_awesome.h>
 #include <esp_heap_caps.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/idf_additions.h>
 #include "esp_audio_dec_default.h"
 #include "esp_audio_simple_dec.h"
 #include "esp_audio_simple_dec_default.h"
@@ -1375,13 +1378,16 @@ bool Application::PlayMusicFromUrl(const std::string& url, const std::string& ti
     args->lyric_url = lyric.empty() ? lyric_url : "";
     args->start_ms = start_ms;
 
-    BaseType_t created = xTaskCreate([](void* arg) {
+    // 播放任务的栈（12KB）放 PSRAM：它只做"读流 → 解码 → 喂 I2S"，
+    // 不写 NVS、不进 Flash 操作，内部 RAM 留给 AFE 和语音链路。
+    BaseType_t created = xTaskCreateWithCaps([](void* arg) {
         std::unique_ptr<MusicPlaybackTaskArgs> task_args(static_cast<MusicPlaybackTaskArgs*>(arg));
         task_args->app->MusicPlaybackTask(std::move(task_args->url), std::move(task_args->title),
                                           std::move(task_args->artist), std::move(task_args->lyric_url),
                                           task_args->start_ms);
-        vTaskDelete(nullptr);
-    }, "music_playback", 12288, args, 3, &music_playback_task_handle_);
+        // 与 xTaskCreateWithCaps 配对，否则 PSRAM 里的栈不会释放
+        vTaskDeleteWithCaps(nullptr);
+    }, "music_playback", 12288, args, 3, &music_playback_task_handle_, MALLOC_CAP_SPIRAM);
 
     if (created != pdPASS) {
         delete args;
@@ -1648,7 +1654,11 @@ void Application::MusicPlaybackTask(std::string url, std::string title, std::str
             codec->EnableOutput(true);
         }
 
-        in_buf = static_cast<uint8_t*>(heap_caps_malloc(kReadBufSize, MALLOC_CAP_8BIT));
+        // 压缩流读缓冲：只被 CPU 读，放 PSRAM 完全没副作用
+        in_buf = static_cast<uint8_t*>(heap_caps_malloc(kReadBufSize, MALLOC_CAP_SPIRAM));
+        // 解码后的 PCM 缓冲：它要直接喂给 I2S DMA，留在内部 RAM。
+        // 这不是偷懒——PSRAM 走 cache，一旦和 LVGL 刷新抢带宽就可能欠载爆音，
+        // 换来的是 8KB 内部 RAM，不值得。
         out_buf = static_cast<uint8_t*>(heap_caps_malloc(out_buf_size, MALLOC_CAP_8BIT));
         if (in_buf == nullptr || out_buf == nullptr) {
             ESP_LOGE(TAG, "内存不足，无法播放音乐");

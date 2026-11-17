@@ -2,6 +2,8 @@
 #define __CUSTOM_LCD_DISPLAY_H__
 
 #include <atomic>
+#include <string>
+#include <vector>
 #include <driver/gpio.h>
 #include "lcd_display.h"
 #include "rlcd_driver.h"
@@ -237,6 +239,41 @@ public:
     // 刷新右下角备忘录列表显示（从 NVS 读取后格式化显示）
     void RefreshMemoDisplay();           // 自动获取锁（外部调用用这个）
     void RefreshMemoDisplayInternal();   // 不获取锁（已持锁时用这个，避免死锁）
+    // ===== 对话浮层（覆盖在任意页面之上）=====
+    // 三个页面各有自己的版式，塞不下对话记录；但"说话时看不到自己和 AI 说了什么"
+    // 是实际使用中最别扭的一点。所以做成一层全屏覆盖：
+    //   进入聆听 → 自动浮上来（不管是天气页、备忘录页还是播放器页）
+    //   工具执行（放歌/翻目录/传图）→ 自动收起，把结果页让出来
+    //   空闲 12 秒 → 自动收起，回到原来的页面
+    //   说一句"看看聊天记录" → 随时手动调出来
+    lv_obj_t *chat_overlay_ = nullptr;
+    lv_obj_t *chat_overlay_time_ = nullptr;
+    lv_obj_t *chat_overlay_badge_ = nullptr;
+    lv_obj_t *chat_user_row_[3] = {nullptr, nullptr, nullptr};
+    lv_obj_t *chat_ai_row_[3] = {nullptr, nullptr, nullptr};
+
+    struct ChatTurn {
+        std::string user;
+        std::string ai;
+    };
+    std::vector<ChatTurn> chat_turns_;      // 最多保留 3 轮
+    bool chat_overlay_visible_ = false;
+    uint32_t chat_hide_at_ms_ = 0;          // 空闲多久后自动收起（0=不收）
+    bool tool_jumped_this_turn_ = false;    // 这一轮里有没有发生"工具跳页"
+
+    void SetupChatOverlay();
+    void AppendChatTurnInternal(const char* role, const char* text);  // 需已持锁
+    void RefreshChatOverlayInternal();                               // 需已持锁
+    void SetChatOverlayVisibleInternal(bool show);                   // 需已持锁
+
+    // 数据更新任务用的是这个：手动调出/收起
+    void SetChatOverlayVisible(bool show);
+    bool IsChatOverlayVisible() const { return chat_overlay_visible_; }
+
+    // 数据更新任务 > 0 表示"页面已经切走了，这一轮别再浮上来"
+    bool ToolJumpedThisTurn() const { return tool_jumped_this_turn_; }
+
+    // 用户按键循环切页
     void CycleDisplayMode();
     bool IsMusicMode() const { return display_mode_ == MODE_MUSIC; }
     bool IsMemoMode() const { return display_mode_ == MODE_MEMO; }

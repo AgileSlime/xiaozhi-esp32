@@ -17,6 +17,7 @@
 #include <string>
 #include <cstring>
 #include <cJSON.h>
+#include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_log.h>
@@ -73,6 +74,8 @@ CustomLcdDisplay::CustomLcdDisplay(esp_lcd_panel_io_handle_t panel_io,
     lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
     port_cfg.task_priority = 2;
     port_cfg.timer_period_ms = 50;
+    // LVGL 任务栈（默认 7KB）挪到 PSRAM：它只做绘制，不参与 DMA，内部 RAM 让给语音前端
+    port_cfg.task_stack_caps = MALLOC_CAP_SPIRAM;
     lvgl_port_init(&port_cfg);
     lvgl_port_lock(0);
 
@@ -100,6 +103,8 @@ CustomLcdDisplay::CustomLcdDisplay(esp_lcd_panel_io_handle_t panel_io,
     SetupWeatherUI();
     SetupMemoUI();
     SetupMusicUI();
+    // 对话浮层必须最后创建：它是三页之上的覆盖层，z 序要在最上面
+    SetupChatOverlay();
     // 告诉显示框架：当前自定义 UI 已经初始化完成
     // 否则基类的 SetStatus/ShowNotification 会一直误判为“UI 未准备好”
     setup_ui_called_ = true;
@@ -223,6 +228,9 @@ void CustomLcdDisplay::SetChatMessage(const char* role, const char* content) {
         system_card_until_ms_ = xTaskGetTickCount() * portTICK_PERIOD_MS + 10000;
         UpdateHomeBottomCard(static_cast<int>(Application::GetInstance().GetDeviceState()));
     }
+
+    // 同一条消息也进对话浮层：不管当前停在哪个页面，说话时都能看到最近三轮
+    AppendChatTurnInternal(role, content);
 
     // 音乐页仍保留原样文字显示
     if (music_chat_status_label_) {
@@ -361,6 +369,10 @@ void CustomLcdDisplay::CycleDisplayMode() {
 // 已经搬到 music_ui.cc，和版式常量放在一起，改布局不用跨文件。
 void CustomLcdDisplay::SwitchToMusicPage() {
     DisplayLockGuard lock(this);
+    // 放歌是个"要看结果"的动作：收起对话浮层，把播放器页让出来。
+    // 标记这一轮已经跳页，AI 后面开始说话时不会再把浮层顶回来。
+    tool_jumped_this_turn_ = true;
+    SetChatOverlayVisibleInternal(false);
     if (display_mode_ != MODE_MUSIC) {
         display_mode_ = MODE_MUSIC;
         ApplyDisplayMode();
@@ -370,6 +382,8 @@ void CustomLcdDisplay::SwitchToMusicPage() {
 
 void CustomLcdDisplay::SwitchToWeatherPage() {
     DisplayLockGuard lock(this);
+    tool_jumped_this_turn_ = true;
+    SetChatOverlayVisibleInternal(false);
     if (display_mode_ != MODE_WEATHER) {
         display_mode_ = MODE_WEATHER;
         ApplyDisplayMode();
@@ -491,15 +505,9 @@ void CustomLcdDisplay::UpdateHomeBottomCard(int device_state) {
                               ds == kDeviceStateListening ||
                               ds == kDeviceStateSpeaking);
 
-    // 用户按下说话时，如果正停在备忘录页，自动回主页——否则看不到识别文字。
-    // 回答阶段（Speaking）故意不切：这样"打开备忘录/下一页"这类工具调用的
-    // 结果能停在目录页上让用户看清，而不是被立刻收走。
-    if (display_mode_ == MODE_MEMO &&
-        (ds == kDeviceStateConnecting || ds == kDeviceStateListening)) {
-        display_mode_ = MODE_WEATHER;
-        ApplyDisplayMode();
-        ESP_LOGI(TAG, "开始语音交互，从备忘录页回到主页");
-    }
+    // 以前这里会在"开始说话"时把备忘录页强制切回主页，否则看不到识别文字。
+    // 现在识别文字进的是全屏对话浮层，浮层盖得住任何页面，
+    // 所以不再抢用户的页面切换——停在备忘录页听完话，还停在备忘录页。
 
     // system 提示临时占用（例如"音量已调到 50%"），到期自动收回
     const uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;

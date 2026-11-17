@@ -1,5 +1,9 @@
 #include "audio_service.h"
 #include <esp_log.h>
+#include <esp_heap_caps.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/idf_additions.h>
 #include <cstring>
 
 #define RATE_CVT_CFG(_src_rate, _dest_rate, _channel)        \
@@ -159,11 +163,15 @@ void AudioService::Start() {
 #endif
 
     /* Start the opus codec task */
-    xTaskCreate([](void* arg) {
+    // 24KB 栈，是内部 RAM 里除 AFE 之外最大的一块。
+    // 它只做"PCM ↔ Opus"的纯 CPU 运算，不碰 I2S DMA、不写 Flash，
+    // 所以整块搬进 PSRAM：内部 RAM 留给 audio_input/audio_output 和语音前端。
+    // （这两个 DMA 任务继续留在内部 RAM，搬走会欠载爆音）
+    xTaskCreateWithCaps([](void* arg) {
         AudioService* audio_service = (AudioService*)arg;
         audio_service->OpusCodecTask();
-        vTaskDelete(NULL);
-    }, "opus_codec", 2048 * 12, this, 2, &opus_codec_task_handle_);
+        vTaskDeleteWithCaps(NULL);
+    }, "opus_codec", 2048 * 12, this, 2, &opus_codec_task_handle_, MALLOC_CAP_SPIRAM);
 }
 
 void AudioService::Stop() {

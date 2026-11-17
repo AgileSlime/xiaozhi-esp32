@@ -136,6 +136,19 @@ bool HomePhoto::RenderFromFile(const char* path, int width, int height) {
         return false;
     }
 
+    const bool ok = RenderFromJpeg(jpg, static_cast<size_t>(file_len), path, width, height);
+    heap_caps_free(jpg);
+    return ok;
+}
+
+// 解码主流程：内存里的 JPEG → 裁剪缩放 → 灰度 → 自动对比度 → 抖动 → RGB565。
+// 文件路径和"网页上传的纯内存"两条入口共用这份实现，效果完全一致。
+bool HomePhoto::RenderFromJpeg(const uint8_t* jpg, size_t file_len, const char* label,
+                               int width, int height) {
+    if (jpg == nullptr || file_len == 0) {
+        return false;
+    }
+
     jpeg_dec_config_t cfg = {};
     cfg.output_type = JPEG_PIXEL_FORMAT_RGB888;
     cfg.scale.width = 0;
@@ -151,13 +164,12 @@ bool HomePhoto::RenderFromFile(const char* path, int width, int height) {
     {
         jpeg_dec_handle_t probe = nullptr;
         if (jpeg_dec_open(&cfg, &probe) != JPEG_ERR_OK) {
-            ESP_LOGE(TAG, "JPEG 解码器初始化失败: %s", path);
-            heap_caps_free(jpg);
+            ESP_LOGE(TAG, "JPEG 解码器初始化失败: %s", label);
             return false;
         }
 
         jpeg_dec_io_t pio = {};
-        pio.inbuf = jpg;
+        pio.inbuf = const_cast<uint8_t*>(jpg);
         pio.inbuf_len = static_cast<int>(file_len);
         pio.inbuf_remain = static_cast<int>(file_len);
 
@@ -166,8 +178,7 @@ bool HomePhoto::RenderFromFile(const char* path, int width, int height) {
         jpeg_dec_close(probe);
 
         if (perr != JPEG_ERR_OK) {
-            ESP_LOGE(TAG, "不是有效的 JPEG: %s (err=%d)", path, static_cast<int>(perr));
-            heap_caps_free(jpg);
+            ESP_LOGE(TAG, "不是有效的 JPEG: %s (err=%d)", label, static_cast<int>(perr));
             return false;
         }
 
@@ -176,8 +187,7 @@ bool HomePhoto::RenderFromFile(const char* path, int width, int height) {
     }
 
     if (src_w < 16 || src_h < 16) {
-        ESP_LOGW(TAG, "图片尺寸异常 %dx%d: %s", src_w, src_h, path);
-        heap_caps_free(jpg);
+        ESP_LOGW(TAG, "图片尺寸异常 %dx%d: %s", src_w, src_h, label);
         return false;
     }
 
@@ -215,8 +225,7 @@ bool HomePhoto::RenderFromFile(const char* path, int width, int height) {
         const long dec_px = static_cast<long>(src_w / scale_div) * (src_h / scale_div);
         if (dec_px * 3L > 6L * 1024L * 1024L) {
             ESP_LOGW(TAG, "图片过大（%dx%d，缩 %d 倍后仍 %ld 像素），跳过: %s",
-                     src_w, src_h, scale_div, dec_px, path);
-            heap_caps_free(jpg);
+                     src_w, src_h, scale_div, dec_px, label);
             return false;
         }
     }
@@ -225,12 +234,11 @@ bool HomePhoto::RenderFromFile(const char* path, int width, int height) {
     jpeg_dec_handle_t dec = nullptr;
     if (jpeg_dec_open(&cfg, &dec) != JPEG_ERR_OK) {
         ESP_LOGE(TAG, "JPEG 解码器初始化失败（第二遍）");
-        heap_caps_free(jpg);
         return false;
     }
 
     jpeg_dec_io_t io = {};
-    io.inbuf = jpg;
+    io.inbuf = const_cast<uint8_t*>(jpg);
     io.inbuf_len = static_cast<int>(file_len);
     io.inbuf_remain = static_cast<int>(file_len);
 
@@ -238,7 +246,6 @@ bool HomePhoto::RenderFromFile(const char* path, int width, int height) {
     if (jpeg_dec_parse_header(dec, &io, &info) != JPEG_ERR_OK) {
         ESP_LOGE(TAG, "JPEG 头解析失败（第二遍）");
         jpeg_dec_close(dec);
-        heap_caps_free(jpg);
         return false;
     }
 
@@ -246,7 +253,6 @@ bool HomePhoto::RenderFromFile(const char* path, int width, int height) {
     if (jpeg_dec_get_outbuf_len(dec, &out_len) != JPEG_ERR_OK || out_len <= 0) {
         ESP_LOGE(TAG, "拿不到解码输出长度");
         jpeg_dec_close(dec);
-        heap_caps_free(jpg);
         return false;
     }
 
@@ -254,14 +260,12 @@ bool HomePhoto::RenderFromFile(const char* path, int width, int height) {
     if (rgb == nullptr) {
         ESP_LOGE(TAG, "解码缓冲分配失败（%d 字节）", out_len);
         jpeg_dec_close(dec);
-        heap_caps_free(jpg);
         return false;
     }
 
     io.outbuf = rgb;
     const jpeg_error_t derr = jpeg_dec_process(dec, &io);
     jpeg_dec_close(dec);
-    heap_caps_free(jpg);
 
     if (derr != JPEG_ERR_OK) {
         ESP_LOGE(TAG, "JPEG 解码失败 (err=%d)", static_cast<int>(derr));
@@ -399,6 +403,25 @@ bool HomePhoto::RenderFromFile(const char* path, int width, int height) {
     const int span = hi - lo;
     const int inv_span = (span > 0) ? span : 1;
 
+    // 顺手把抖动结果也存一份 1bpp：网页上传的图靠它活过"下一次重绘"
+    // （不存的话每分钟的 UI 刷新会把它顶回默认壁纸）
+    const size_t stride = (static_cast<size_t>(width) + 7) / 8;
+    const size_t bits_bytes = stride * static_cast<size_t>(height);
+    if (override_bits_ == nullptr || override_bytes_ < bits_bytes ||
+        override_w_ != width || override_h_ != height) {
+        if (override_bits_ != nullptr) {
+            heap_caps_free(override_bits_);
+            override_bits_ = nullptr;
+        }
+        override_bits_ = static_cast<uint8_t*>(heap_caps_malloc(bits_bytes, MALLOC_CAP_SPIRAM));
+        override_bytes_ = (override_bits_ != nullptr) ? bits_bytes : 0;
+        override_w_ = width;
+        override_h_ = height;
+    }
+    if (override_bits_ != nullptr) {
+        memset(override_bits_, 0, bits_bytes);
+    }
+
     // ---- 抖动 + 写 RGB565 ----
     uint16_t* dst = reinterpret_cast<uint16_t*>(pixel_buf_);
     for (int y = 0; y < height; y++) {
@@ -415,7 +438,14 @@ bool HomePhoto::RenderFromFile(const char* path, int width, int height) {
             }
             // 阈值 = bayer * 4 + 2（把 0-63 铺到 0-254）
             const int threshold = static_cast<int>(bayer_row[x & 7]) * 4 + 2;
-            dst_row[x] = (v > threshold) ? 0xFFFF : 0x0000;
+            const bool white = (v > threshold);
+            dst_row[x] = white ? 0xFFFF : 0x0000;
+            if (override_bits_ != nullptr) {
+                uint8_t* bits_row = override_bits_ + static_cast<size_t>(y) * stride;
+                if (white) {
+                    bits_row[x >> 3] |= static_cast<uint8_t>(0x80 >> (x & 7));
+                }
+            }
         }
     }
 
@@ -424,7 +454,7 @@ bool HomePhoto::RenderFromFile(const char* path, int width, int height) {
     heap_caps_free(rgb);
 
     ESP_LOGI(TAG, "图片已抖动渲染: %s（源 %dx%d → 解码 %dx%d → 输出 %dx%d）",
-             path, src_w, src_h, ow, oh, width, height);
+             label, src_w, src_h, ow, oh, width, height);
     return true;
 }
 
@@ -464,11 +494,58 @@ bool HomePhoto::RenderDefault(int width, int height) {
     return true;
 }
 
+// 把网页上传那张图的 1bpp 位图展开成 RGB565（和 RenderDefault 同一套做法）
+bool HomePhoto::RenderOverride(int width, int height) {
+    if (!override_active_ || override_bits_ == nullptr ||
+        override_w_ <= 0 || override_h_ <= 0) {
+        return false;
+    }
+    if (!EnsureBuffers(width, height)) {
+        return false;
+    }
+
+    const size_t stride = (static_cast<size_t>(override_w_) + 7) / 8;
+    uint16_t* dst = reinterpret_cast<uint16_t*>(pixel_buf_);
+    for (int y = 0; y < height; y++) {
+        const int sy = static_cast<int>(static_cast<long>(y) * override_h_ / height);
+        const uint8_t* row = override_bits_ + static_cast<long>(sy) * stride;
+        uint16_t* dst_row = dst + static_cast<long>(y) * width;
+        for (int x = 0; x < width; x++) {
+            const int sx = static_cast<int>(static_cast<long>(x) * override_w_ / width);
+            const bool white = (row[sx >> 3] & (0x80 >> (sx & 7))) != 0;
+            dst_row[x] = white ? 0xFFFF : 0x0000;
+        }
+    }
+    return true;
+}
+
+bool HomePhoto::LoadOverrideLocked(lv_obj_t* img, int width, int height) {
+    if (!RenderOverride(width, height)) {
+        return false;
+    }
+    showing_default_ = false;
+    current_index_ = -1;
+    current_name_ = override_name_;
+    lv_image_set_src(img, &dsc_);
+    return true;
+}
+
 bool HomePhoto::LoadDefault(lv_obj_t* img, int width, int height) {
     if (img == nullptr) {
         return false;
     }
     std::lock_guard<std::mutex> lk(mutex_);
+
+    // 网页上传过图之后，默认图不该再抢位置
+    if (override_active_) {
+        if (RenderOverride(width, height)) {
+            lv_image_set_src(img, &dsc_);
+            current_index_ = -1;
+            current_name_ = override_name_;
+            showing_default_ = false;
+            return true;
+        }
+    }
 
     // data_update_task 每分钟会重试一次"首次加载失败"，如果已经在显示默认图，
     // 直接返回成功、不重画 —— 否则每分钟刷一次同画面，1-bit 屏上会看到闪一下。
@@ -488,6 +565,14 @@ bool HomePhoto::LoadDefault(lv_obj_t* img, int width, int height) {
 
 // 锁内实现：不重复加锁，供 Load / Next 复用
 bool HomePhoto::LoadLocked(lv_obj_t* img, int width, int height, int index) {
+    // 网页上传的那张图优先于 SD 卡：它就是"当前这张"
+    if (override_active_) {
+        if (LoadOverrideLocked(img, width, height)) {
+            return true;
+        }
+        // 位图展不开（PSRAM 不够）才落到后面的 SD / 默认图
+    }
+
     if (!scanned_) {
         RefreshList();
     }
@@ -535,6 +620,14 @@ bool HomePhoto::Next(lv_obj_t* img, int width, int height) {
         return false;
     }
     std::lock_guard<std::mutex> lk(mutex_);
+
+    // "换一张"是明确的换图指令：先撤销上传的那张，回到 SD 卡轮换
+    // （否则 override 会永远压在上面，用户会觉得换图没反应）
+    if (override_active_) {
+        override_active_ = false;
+        ESP_LOGI(TAG, "已撤销网页上传的图片，回到 SD 卡轮换");
+    }
+
     if (!scanned_) {
         RefreshList();
     }
@@ -571,4 +664,33 @@ int HomePhoto::IndexOf(const std::string& path_or_name) const {
         }
     }
     return -1;
+}
+
+// ===== 一次性图片（网页上传）=====
+
+bool HomePhoto::ApplyJpegMemory(const uint8_t* jpg, size_t len, int width, int height) {
+    if (jpg == nullptr || len == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lk(mutex_);
+
+    if (!RenderFromJpeg(jpg, len, "网页上传", width, height)) {
+        return false;
+    }
+    override_active_ = true;
+    showing_default_ = false;
+    current_index_ = -1;
+    current_name_ = override_name_;
+    ESP_LOGI(TAG, "网页上传的图片已生效（不落 SD，重启恢复默认）");
+    return true;
+}
+
+void HomePhoto::ClearOverride() {
+    std::lock_guard<std::mutex> lk(mutex_);
+    override_active_ = false;
+}
+
+bool HomePhoto::HasOverride() const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    return override_active_;
 }

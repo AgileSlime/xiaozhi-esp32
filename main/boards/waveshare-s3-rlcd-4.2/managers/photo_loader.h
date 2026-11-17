@@ -43,6 +43,16 @@ public:
     // 位图已经是在 PC 上抖动好的 1bpp，这里只做"展开成 RGB565"，不解码、不占额外内存。
     bool LoadDefault(lv_obj_t* img, int width, int height);
 
+    // ===== 一次性图片（不落 SD，上传即生效）=====
+    // 网页上传走这条通道：JPEG 在内存里解码 + 抖动 → 存成 1bpp 位图（210×248 只要 6510 字节）
+    // → 立刻铺到主页。不写 SD 卡，所以不依赖读卡器、也不会越传越多；
+    // 代价是重启后回到内置默认壁纸（或者 SD 卡里原有的图）。
+    bool ApplyJpegMemory(const uint8_t* jpg, size_t len, int width, int height);
+    void ClearOverride();
+    bool HasOverride() const;
+    // 当前这次的图片是谁（网页列表里显示用）
+    const std::string& OverrideName() const { return override_name_; }
+
     // 当前显示的是第几张、叫什么
     int CurrentIndex() const { return current_index_; }
     const std::string& CurrentName() const { return current_name_; }
@@ -63,10 +73,16 @@ private:
 
     void RefreshList();
     bool RenderFromFile(const char* path, int width, int height);
+    // 真正的解码实现：JPEG 在内存里 → 裁剪缩放 → 抖动 → 写 pixel_buf_
+    // RenderFromFile 和 ApplyJpegMemory 都走这里，保证两条路径出来的效果完全一致
+    bool RenderFromJpeg(const uint8_t* jpg, size_t len, const char* label, int width, int height);
     bool RenderDefault(int width, int height);
+    // 把 override_bits_ 里的 1bpp 位图展开成 RGB565
+    bool RenderOverride(int width, int height);
     bool EnsureBuffers(int width, int height);
     // 不加锁的加载实现：调用者必须已持有 mutex_
     bool LoadLocked(lv_obj_t* img, int width, int height, int index);
+    bool LoadOverrideLocked(lv_obj_t* img, int width, int height);
 
     static constexpr const char* TAG = "HomePhoto";
 
@@ -86,6 +102,15 @@ private:
     uint8_t* pixel_buf_ = nullptr;      // RGB565 输出（PSRAM）
     lv_image_dsc_t dsc_ = {};
     bool dsc_ready_ = false;
+
+    // 一次性图片：抖动后的 1bpp 位图（每行 (w+7)/8 字节，MSB 在前，1=白）
+    // 210×248 = 6510 字节，比存 JPEG 还省，重启即失（不写 Flash）
+    uint8_t* override_bits_ = nullptr;
+    size_t override_bytes_ = 0;
+    int override_w_ = 0;
+    int override_h_ = 0;
+    bool override_active_ = false;
+    std::string override_name_ = "网页上传";
 };
 
 #endif

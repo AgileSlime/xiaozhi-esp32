@@ -4,6 +4,10 @@
 #include <sys/time.h>
 
 #include <esp_log.h>
+#include <esp_heap_caps.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/idf_additions.h>
 
 #include "application.h"
 #include "../secret_config.h"
@@ -34,7 +38,9 @@ bool ClockService::Start(uint32_t stack_size, UBaseType_t priority) {
     // 先发一拍：让启动阶段（NTP 还没开始时）也有有效时间可读，避免 UI 显示 00:00
     PublishTick(true);
 
-    BaseType_t created = xTaskCreate(TaskEntry, "clock_task", stack_size, this, priority, &task_handle_);
+    // 栈放 PSRAM：纯计时/回调任务，不进中断也不碰 DMA，占用内部 RAM 不划算
+    BaseType_t created = xTaskCreateWithCaps(TaskEntry, "clock_task", stack_size, this,
+                                             priority, &task_handle_, MALLOC_CAP_SPIRAM);
     if (created != pdPASS) {
         task_handle_ = nullptr;
         ESP_LOGE(TAG, "时钟任务创建失败（内存不足？）");
@@ -58,7 +64,8 @@ ClockTick ClockService::Snapshot() const {
 
 void ClockService::TaskEntry(void* arg) {
     static_cast<ClockService*>(arg)->Run();
-    vTaskDelete(nullptr);
+    // 用 WithCaps 创建的任务必须用 WithCaps 删除，否则 PSRAM 里的栈不会被释放
+    vTaskDeleteWithCaps(nullptr);
 }
 
 bool ClockService::NetworkReady() const {

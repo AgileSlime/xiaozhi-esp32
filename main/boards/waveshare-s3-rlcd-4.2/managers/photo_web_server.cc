@@ -10,8 +10,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 
+#include "photo_loader.h"
 #include "sdcard_manager.h"
 #include "wifi_manager.h"
 
@@ -42,25 +44,22 @@ li span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-right:
 .del{color:#ff3b30;font-size:13px;background:none;border:none;cursor:pointer;flex:none}
 .empty{color:#c7c7cc;font-size:13px;text-align:center;padding:12px 0;display:block}
 </style></head><body>
-<h1>相册上传</h1>
-<div class="sub">图片存到设备 SD 卡，主页每天自动换一张</div>
+<h1>换成我的图片</h1>
+<div class="sub">选一张就行，传完立刻显示在屏幕上。不写 SD 卡，设备重启会回到内置默认图。</div>
 <div class="card">
   <div id="drop">点击选择图片<br><span style="font-size:12px">也可以把图片拖进来</span></div>
-  <input type="file" id="file" accept="image/*" multiple>
-  <label style="display:flex;align-items:center;gap:8px;margin-top:12px;font-size:12.5px;color:#86868b;cursor:pointer">
-    <input type="checkbox" id="raw" style="margin:0">保留原图（不裁剪不压缩，占 SD 空间、上传慢）
-  </label>
+  <input type="file" id="file" accept="image/*">
   <div class="bar" id="bar"><i id="barin"></i></div>
   <div id="log"></div>
 </div>
 <div class="card">
-  <div style="font-size:14px;font-weight:600;margin-bottom:4px">设备上的图片</div>
-  <ul id="list"><li class="empty">加载中</li></ul>
+  <div style="font-size:14px;font-weight:600;margin-bottom:6px">屏幕当前显示</div>
+  <div id="cur" style="font-size:13px;color:#86868b">读取中…</div>
 </div>
 <script>
 var drop=document.getElementById('drop'),file=document.getElementById('file'),
     bar=document.getElementById('bar'),barin=document.getElementById('barin'),
-    log=document.getElementById('log');
+    log=document.getElementById('log'),cur=document.getElementById('cur');
 drop.onclick=function(){file.click()};
 drop.ondragover=function(e){e.preventDefault();drop.classList.add('on')};
 drop.ondragleave=function(){drop.classList.remove('on')};
@@ -70,16 +69,9 @@ file.onchange=function(){up(file.files)};
 //   1) 按 210:248 居中裁剪（和固件里的 cover 裁剪同一套规则，网页上看到的就是屏上的构图）
 //   2) 缩到 420×496（2 倍），固件那边再做 2×2 平均，边缘比直接 1:1 干净
 //   3) 转成 JPEG（质量 0.9），一张大约 25~40KB
-// 8MB 原图在 ESP32 的 WiFi 上要传十几秒还容易断，还会把 SD 卡塞满；30KB 是瞬间的事。
-// 勾上"保留原图"则原封不动上传（用于别的用途）。
+// 原图动辄几 MB，在 ESP32 的 WiFi 上传要十几秒还容易断；30KB 是瞬间的事。
 var TW=210, TH=248, UW=420, UH=496;
 
-function jpgName(n){
-  var d=n.lastIndexOf('.');
-  return ((d<0?n:n.substring(0,d))||'photo')+'.jpg';
-}
-
-// 裁成 210:248 再缩到 420×496，返回 JPEG Blob
 function prepare(f){
   return new Promise(function(res,rej){
     var url=URL.createObjectURL(f), img=new Image();
@@ -107,55 +99,39 @@ function prepare(f){
 
 function up(files){
   if(!files||!files.length)return;
+  // 只保留最后一张：这个模式就是"一张覆盖一张"
+  var f=files[files.length-1];
   bar.style.display='block';barin.style.width='0';
-  var raw=document.getElementById('raw').checked;
-  var i=0,ok=0;
-  function next(){
-    if(i>=files.length){
-      log.textContent='完成，成功 '+ok+'/'+files.length;
-      bar.style.display='none';file.value='';loadList();return;
-    }
-    var f=files[i];
-    log.textContent='正在处理 '+(i+1)+'/'+files.length+'：'+f.name;
-    (raw?Promise.resolve(f):prepare(f)).then(function(b){
-      log.textContent='正在上传 '+(i+1)+'/'+files.length+'：'+f.name+
-                      '（'+Math.round(b.size/1024)+' KB）';
-      return post(b, raw?f.name:jpgName(f.name));
-    }).then(function(){ok++;i++;next()},function(err){
-      log.textContent=f.name+' 失败：'+err;i++;next();
-    });
-  }
-  next();
+  log.textContent='正在处理：'+f.name;
+  prepare(f).then(function(b){
+    log.textContent='正在上传（'+Math.round(b.size/1024)+' KB）';
+    return post(b);
+  }).then(function(){
+    log.textContent='已显示到屏幕上';
+    bar.style.display='none';file.value='';refresh();
+  }).catch(function(err){
+    log.textContent='失败：'+err;
+    bar.style.display='none';file.value='';
+  });
 }
-function post(b,name){
+function post(b){
   return new Promise(function(res,rej){
     var x=new XMLHttpRequest();
-    x.open('POST','/upload?name='+encodeURIComponent(name));
+    x.open('POST','/upload');
     x.upload.onprogress=function(e){if(e.lengthComputable)barin.style.width=(e.loaded/e.total*100)+'%'};
     x.onload=function(){x.status==200?res():rej(x.responseText||('HTTP '+x.status))};
     x.onerror=function(){rej('网络错误')};
     x.send(b);
   });
 }
-function esc(s){return s.replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
-function loadList(){
-  var ul=document.getElementById('list');
-  fetch('/list').then(function(r){return r.json()}).then(function(arr){
-    if(!arr.length){ul.innerHTML='<li class="empty">还没有图片</li>';return}
-    ul.innerHTML=arr.map(function(n){
-      return '<li><span>'+esc(n)+'</span><button class="del" data-n="'+esc(n)+'">删除</button></li>';
-    }).join('');
-    var ds=ul.querySelectorAll('.del');
-    for(var k=0;k<ds.length;k++){
-      ds[k].onclick=function(){
-        var n=this.getAttribute('data-n');
-        if(!confirm('删除 '+n+' ?'))return;
-        fetch('/delete?name='+encodeURIComponent(n),{method:'POST'}).then(loadList);
-      };
-    }
-  }).catch(function(){ul.innerHTML='<li class="empty">读取失败</li>'});
+function refresh(){
+  fetch('/list').then(function(r){return r.json()}).then(function(o){
+    if(o.override){cur.textContent='网页上传的图片（重启后恢复默认）'}
+    else if(o.sd_count>0){cur.textContent='SD 卡里的 '+o.sd_count+' 张照片'}
+    else{cur.textContent='内置默认壁纸'}
+  }).catch(function(){cur.textContent='读取失败'});
 }
-loadList();
+refresh();
 </script>
 </body></html>)HTML";
 
@@ -216,27 +192,6 @@ static bool EndsWith(const std::string& s, const char* suffix) {
     return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
 }
 
-// 文件名冲突时追加 _1 _2 ...
-static std::string UniquePath(const std::string& dir, const std::string& name) {
-    char buf[256];
-    snprintf(buf, sizeof(buf), "%s/%s", dir.c_str(), name.c_str());
-    if (access(buf, F_OK) != 0) {
-        return buf;
-    }
-
-    const size_t dot = name.find_last_of('.');
-    const std::string stem = (dot == std::string::npos) ? name : name.substr(0, dot);
-    const std::string ext = (dot == std::string::npos) ? "" : name.substr(dot);
-
-    for (int i = 1; i < 1000; i++) {
-        snprintf(buf, sizeof(buf), "%s/%s_%d%s", dir.c_str(), stem.c_str(), i, ext.c_str());
-        if (access(buf, F_OK) != 0) {
-            return buf;
-        }
-    }
-    return buf;
-}
-
 static bool GetNameParam(httpd_req_t* req, std::string* out) {
     char query[256] = {0};
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
@@ -281,60 +236,42 @@ esp_err_t PhotoWebServer::IndexHandler(httpd_req_t* req) {
 }
 
 esp_err_t PhotoWebServer::ListHandler(httpd_req_t* req) {
-    std::string json = "[";
-    bool first = true;
+    const bool override_active = HomePhoto::GetInstance().HasOverride();
 
+    int sd_count = 0;
     auto& sd = SdcardManager::getInstance();
     if (sd.isMounted()) {
         auto files = sd.listFiles(kPhotoDir, ".jpg");
         auto files2 = sd.listFiles(kPhotoDir, ".jpeg");
-        files.insert(files.end(), files2.begin(), files2.end());
-
-        for (const auto& path : files) {
-            const size_t slash = path.find_last_of('/');
-            const std::string base = (slash == std::string::npos) ? path : path.substr(slash + 1);
-            if (!first) {
-                json += ",";
-            }
-            json += "\"" + base + "\"";
-            first = false;
-        }
+        sd_count = static_cast<int>(files.size() + files2.size());
     }
-    json += "]";
+
+    char json[96];
+    snprintf(json, sizeof(json), "{\"override\":%s,\"sd_count\":%d}",
+             override_active ? "true" : "false", sd_count);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    return httpd_resp_send(req, json.c_str(), json.size());
+    return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
 }
 
 esp_err_t PhotoWebServer::UploadHandler(httpd_req_t* req) {
-    char name[192] = {0};
-    if (!GetSafeName(req, name, sizeof(name))) {
-        httpd_resp_set_status(req, "400 Bad Request");
-        return httpd_resp_send(req, "文件名无效，仅接受 .jpg / .jpeg", HTTPD_RESP_USE_STRLEN);
-    }
-
-    auto& sd = SdcardManager::getInstance();
-    if (!sd.isMounted()) {
+    // 一次性图片：整张 JPEG 先读进 PSRAM，然后在内存里解码 + 抖动 + 直接显示。
+    // 不写 SD 卡，所以插不插卡都能用，也不会"越传越多"——新的一张直接覆盖上一张。
+    size_t cap = 256 * 1024;
+    uint8_t* buf = static_cast<uint8_t*>(heap_caps_malloc(cap, MALLOC_CAP_SPIRAM));
+    if (buf == nullptr) {
         httpd_resp_set_status(req, "500 Internal Server Error");
-        return httpd_resp_send(req, "SD 卡未挂载", HTTPD_RESP_USE_STRLEN);
+        return httpd_resp_send(req, "内存不足，无法接收图片", HTTPD_RESP_USE_STRLEN);
     }
 
-    mkdir(kPhotoDir, 0777);
-
-    const std::string path = UniquePath(kPhotoDir, name);
-    FILE* f = fopen(path.c_str(), "wb");
-    if (f == nullptr) {
-        ESP_LOGE(TAG, "打不开文件写入: %s", path.c_str());
-        httpd_resp_set_status(req, "500 Internal Server Error");
-        return httpd_resp_send(req, "SD 卡写入失败", HTTPD_RESP_USE_STRLEN);
-    }
-
-    char buf[4096];
+    char chunk[4096];
     size_t total = 0;
-    bool too_big = false;
+    bool failed = false;
+    const char* fail_reason = nullptr;
+
     while (true) {
-        const int r = httpd_req_recv(req, buf, sizeof(buf));
+        const int r = httpd_req_recv(req, chunk, sizeof(chunk));
         if (r == HTTPD_SOCK_ERR_TIMEOUT) {
             continue;  // 网络抖动，继续等
         }
@@ -342,27 +279,51 @@ esp_err_t PhotoWebServer::UploadHandler(httpd_req_t* req) {
             break;
         }
         if (total + static_cast<size_t>(r) > kMaxUploadBytes) {
-            too_big = true;
+            failed = true;
+            fail_reason = "图片超过 8MB";
             break;
         }
-        if (fwrite(buf, 1, static_cast<size_t>(r), f) != static_cast<size_t>(r)) {
-            fclose(f);
-            unlink(path.c_str());
-            httpd_resp_set_status(req, "500 Internal Server Error");
-            return httpd_resp_send(req, "写入中断", HTTPD_RESP_USE_STRLEN);
+        if (total + static_cast<size_t>(r) > cap) {
+            size_t new_cap = cap;
+            while (new_cap < total + static_cast<size_t>(r)) {
+                new_cap *= 2;
+            }
+            auto* grown = static_cast<uint8_t*>(heap_caps_realloc(buf, new_cap, MALLOC_CAP_SPIRAM));
+            if (grown == nullptr) {
+                failed = true;
+                fail_reason = "内存不足，图片太大";
+                break;
+            }
+            buf = grown;
+            cap = new_cap;
         }
+        memcpy(buf + total, chunk, static_cast<size_t>(r));
         total += static_cast<size_t>(r);
     }
-    fclose(f);
 
-    if (too_big || total == 0) {
-        unlink(path.c_str());
-        httpd_resp_set_status(req, too_big ? "413 Payload Too Large" : "400 Bad Request");
-        return httpd_resp_send(req, too_big ? "图片超过 8MB" : "空文件", HTTPD_RESP_USE_STRLEN);
+    if (!failed && total == 0) {
+        failed = true;
+        fail_reason = "空文件";
     }
 
-    ESP_LOGI(TAG, "收到图片 %s（%u 字节）", path.c_str(), static_cast<unsigned>(total));
-    GetInstance().NotifyUploaded(path);
+    bool applied = false;
+    if (!failed) {
+        // 目标尺寸和主页照片位一致（外框 214×252 去掉 2px 边框）
+        applied = HomePhoto::GetInstance().ApplyJpegMemory(buf, total, 210, 248);
+    }
+    heap_caps_free(buf);
+
+    if (failed) {
+        httpd_resp_set_status(req, "413 Payload Too Large");
+        return httpd_resp_send(req, fail_reason, HTTPD_RESP_USE_STRLEN);
+    }
+    if (!applied) {
+        httpd_resp_set_status(req, "422 Unprocessable Entity");
+        return httpd_resp_send(req, "这张图解不开，请换一张 JPG/PNG", HTTPD_RESP_USE_STRLEN);
+    }
+
+    ESP_LOGI(TAG, "收到图片（%u 字节），已在内存中解码并显示", static_cast<unsigned>(total));
+    GetInstance().NotifyUploaded("ram:upload");
 
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
@@ -394,11 +355,10 @@ bool PhotoWebServer::Start() {
         return true;
     }
 
-    if (!SdcardManager::getInstance().isMounted()) {
-        ESP_LOGE(TAG, "SD 卡未挂载，无法提供图片上传");
-        return false;
+    // 不再要求插 SD 卡：一次性图片走内存，没卡也能传
+    if (SdcardManager::getInstance().isMounted()) {
+        mkdir(kPhotoDir, 0777);
     }
-    mkdir(kPhotoDir, 0777);
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
