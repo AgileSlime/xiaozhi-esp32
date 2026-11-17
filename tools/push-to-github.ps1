@@ -165,10 +165,32 @@ foreach ($n in "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PR
     }
 }
 
+# ---- 绕开坏掉的老版 GCM ----
+# git 2.20 自带的 credential.helper=manager（GCM 1.x）走的是 GitHub 早废弃的密码认证，
+# 无论输密码还是 token 都会 "Logon failed"，而且 manager 写在 C:\ProgramData\Git\config，
+# 改它需要管理员权限。GIT_CONFIG_NOSYSTEM 让 git 只读 全局 + 仓库级配置，manager 就没了，
+# 代价是系统配置里的 TLS 证书路径也要自己补回来。
+$caPath = ""
+$execPath = (& git --exec-path 2>$null)
+if ($execPath) {
+    $cand = Join-Path (Split-Path -Parent (Split-Path -Parent $execPath.Trim())) "ssl\certs\ca-bundle.crt"
+    if (Test-Path $cand) { $caPath = $cand }
+}
+$env:GIT_CONFIG_NOSYSTEM = "1"
+
+# 仓库级凭据助手：wincred（Windows 凭据管理器，DPAPI 加密存储）
+$helpers = @(& git config --local --get-all credential.helper 2>$null)
+if (-not ($helpers -contains "wincred")) {
+    & git config --local --add credential.helper wincred 2>&1 | Out-Null
+}
+
 # 代理和超时都以 -c 形式临时传给 git，不落盘、不影响其他仓库
 $gitOpts = @()
 if ($proxyUrl -ne "") {
     $gitOpts += @("-c", "http.proxy=$proxyUrl", "-c", "https.proxy=$proxyUrl")
+}
+if ($caPath -ne "") {
+    $gitOpts += @("-c", "http.sslCAInfo=$caPath")
 }
 # 速度低于 1KB/s 持续 20 秒就断，避免网络半死时无限挂起
 $gitOpts += @("-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=20")
@@ -226,17 +248,25 @@ if ($authIssue) {
     }
 }
 
+$refspec = "main:refs/heads/$Branch"
+
 if ($DryRun) {
     Write-Host ""
-    Write-Host "DryRun：尚未推送。真实推送请去掉 -DryRun 重跑。" -ForegroundColor Yellow
-    Write-Host "将执行：git push -u origin main:refs/heads/$Branch" -ForegroundColor DarkGray
-    exit 0
+    Write-Host "DryRun：做一次完整握手（含凭据），但不写远端。" -ForegroundColor Yellow
+    & git @gitOpts push --dry-run -u origin $refspec 2>&1 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "DryRun 通过：网络、TLS、凭据全部正常，可以真推了。" -ForegroundColor Green
+    } else {
+        Write-Host "DryRun 失败：上面就是原因。" -ForegroundColor Red
+    }
+    exit $LASTEXITCODE
 }
 
 # ---------------- 推送 ----------------
-$refspec = "main:refs/heads/$Branch"
 Write-Host ""
-Write-Host "开始推送（首次会弹 GitHub 登录窗，密码栏填 Personal Access Token）..." -ForegroundColor Yellow
+Write-Host "开始推送..." -ForegroundColor Yellow
+Write-Host "提示：控制台会问 Username 和 Password —— Username 填 $User，" -ForegroundColor DarkGray
+Write-Host "      Password 填 Personal Access Token（不是账号密码），粘一次就会存进凭据管理器。" -ForegroundColor DarkGray
 if ($Force) {
     & git @gitOpts push -u origin $refspec --force
 } else {
