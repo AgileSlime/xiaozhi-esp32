@@ -1,0 +1,12 @@
+# ESP-IDF Partition Table
+# Name,   Type, SubType, Offset,  Size, Flags
+# 注意：本表相对 16m.csv.bak-assets6m 做了重排
+#   assets 实际只用了 2.7MB，原 6M 里 3.3MB 是空的
+#   缩到 4M 后，省出的 2M 平分给 ota_0/ota_1（各 0x4F0000 -> 0x5F0000）
+#   目的：给 20px 字库（约 222KB）和后续功能留出余量
+nvs,      data, nvs,     0x9000,    0x4000,
+otadata,  data, ota,     0xd000,    0x2000,
+phy_init, data, phy,     0xf000,    0x1000,
+ota_0,    app,  ota_0,   0x20000,   0x5F0000,
+ota_1,    app,  ota_1,   0x610000,  0x5F0000,
+assets,   data, spiffs,  0xC00000,  4M
