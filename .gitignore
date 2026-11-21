@@ -31,3 +31,7 @@ tools/xiaozhi-console/target/
 # 网易云登录凭证（MUSIC_U 等于账号登录态，绝不入库）
 tools/xiaozhi-console/cookie.txt
 tools/netease-relay/cookie.txt
+
+# 本地推送/凭证工具，不随仓库分发
+tools/push-to-github.ps1
+tools/set-github-token.ps1
