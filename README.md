@@ -1,39 +1,39 @@
 # 小智 RLCD 桌面摆件
 
-> 基于 ESP32-S3 的 4.2 英寸黑白反射屏 AI 桌面助手：语音对话、网易云音乐、歌词滚动、备忘录提醒、自定义壁纸与头像。
+基于 ESP32-S3 的 4.2 英寸黑白反射屏 AI 桌面助手。开机是桌面摆件，说话时是语音助手，放歌时是歌词机。
 
-一块 400×300 的单色 RLCD 屏，不需要背光也能看清。开机是桌面摆件，说话时是语音助手，放歌时是歌词机。
+无需背光也能清晰阅读，放在桌上一直亮着。
 
 ---
 
 ## 功能
 
-### 语音助手
+### 语音
 
-- 离线唤醒词 **「你好小智」**（ESP-SR WakeNet9，不联网也能唤醒）
-- 播放音乐时**同样可唤醒**（麦克风常开，不与音频输出抢通道）
-- 流式 ASR → LLM → TTS，支持打断
-- 按键强制对话（唤醒词失效时的兜底）
+- 唤醒词「你好小智」，离线识别，不联网也能唤醒
+- 播放音乐时同样可以唤醒
+- 说话可随时打断回复
+- 唤醒不灵时，按键可以直接进入对话
 
-### 音乐播放
+### 音乐
 
-- 网易云搜索与播放，配置 cookie 后可播 VIP 曲目
-- **原唱优先**：先按歌手硬过滤，再按歌名/时长/翻唱标记打分
-- LRC 歌词三行滚动，当前句黑底白字反白
-- 唱片中心头像支持自定义（1-bit 点阵，网页上传）
-- 静态唱片（不做旋转动画，把 CPU 让给音频解码）
+- 搜索并播放网易云音乐，登录后可听 VIP 曲目
+- 自动优先选择原唱版本
+- 歌词三行滚动，当前句反白突出
+- 唱片中心可换成自己的头像
 
 ### 桌面
 
+三个页面，随场景自动切换：
+
 | 页面 | 内容 |
 |---|---|
-| 天气站 | 自定义壁纸、时间日期、室内温湿度、备忘录列表 |
+| 天气站 | 自定义壁纸、时间日期、室内温湿度、备忘录 |
 | 备忘录 | 分页浏览、定时提醒 |
-| 播放器 | 唱片 + 头像、曲名歌手、歌词、进度条、控制键 |
+| 播放器 | 唱片与头像、曲名歌手、歌词、进度条、控制键 |
 
-- 壁纸：网页上传，210×248 抖动成 1-bit，存 NVS，重启不丢
-- 头像：网页上传，52×52 抖动成 1-bit，存独立 NVS
-- 提醒：到点自动切回主页并**连响 3 次**
+- 壁纸和头像都能在网页上传，重启后依然保留
+- 备忘录到点会切回主页并响铃提醒
 
 ---
 
@@ -41,144 +41,151 @@
 
 | 项目 | 规格 |
 |---|---|
-| 主控 | ESP32-S3（16 MB Flash / 8 MB PSRAM） |
-| 屏幕 | 4.2 英寸 RLCD，400×300，单色（1-bit） |
-| 音频 | ES8311 编解码器 + 双麦克风 + 扬声器 |
-| 存储 | 可选 microSD（壁纸目录 `/sdcard/photos`） |
+| 主控 | ESP32-S3，16 MB Flash / 8 MB PSRAM |
+| 屏幕 | 4.2 英寸 RLCD，400×300 单色 |
+| 音频 | ES8311 编解码器，双麦克风，扬声器 |
+| 存储 | 可选 microSD 卡 |
 | 供电 | USB-C |
 
-开发板型号：`waveshare-s3-rlcd-4.2`
+对应开发板型号：`waveshare-s3-rlcd-4.2`
 
 ---
 
 ## 快速开始
 
-### 1. 烧录固件
+### 烧录固件
 
-需要 [ESP-IDF v5.5](https://docs.espressif.com/projects/esp-idf/zh_CN/latest/esp32s3/get-started/) 环境。
+需要 ESP-IDF v5.5 开发环境。
 
 ```bash
 idf.py set-target esp32s3
 idf.py build
 ```
 
-仓库根目录提供了一键烧录脚本（Windows）：
+Windows 下也可以直接双击仓库根目录的脚本：
 
-```bat
+```
 flash.bat
 ```
 
-### 2. 配网
+### 配网
 
-首次开机自动进入配网模式（`78/xiaozhi-esp32` 配网协议），用手机连接设备热点后填写 WiFi 信息。
+首次开机会进入配网模式。手机连接设备发出的热点，填写 WiFi 名称和密码即可。
 
-### 3. 启动控制台（可选，但强烈推荐）
+### 启动控制台
 
-控制台提供网易云登录、壁纸/头像上传、点歌等能力。
+控制台用来登录网易云、上传壁纸头像、点歌，建议配合使用。
 
-```bat
+```
 tools\xiaozhi-console\start.bat
 ```
 
-- 浏览器自动打开 `http://localhost:8800`
-- 需要 **Java 17 或更高**（脚本会自动扫描全盘寻找，不依赖 `JAVA_HOME`）
-- 板子与电脑在同一局域网即可，控制台通过 UDP 广播自动发现
+启动后浏览器会自动打开 `http://localhost:8800`。
+
+运行需要 Java 17 或更高版本。脚本会自动查找本机可用的 Java，不需要手动配置环境变量。
+
+板子和电脑连在同一个 WiFi 下即可，控制台会自动发现设备。
 
 ---
 
 ## 控制台
 
-### 网易云登录
+### 登录网易云
 
-三种方式，任选其一：
+两种方式，任选其一。
 
-1. **扫码登录**：控制台首页「网易云登录」→ 生成二维码 → 手机网易云 App 扫码确认
-2. **手动贴 cookie**：浏览器登录 [music.163.com](https://music.163.com)，F12 → Application → Cookies → 复制 `MUSIC_U` 的值，写入 `tools/xiaozhi-console/cookie.txt`
-3. **整行 Cookie**：F12 → Network → 任意请求 → Request Headers → 复制整行 `Cookie`
+**扫码登录**
 
-> `MUSIC_U` 是 **HttpOnly** cookie，`document.cookie` 读不到，必须从 Application 面板或请求头获取。
+在控制台首页找到「网易云登录」，点击生成二维码，用手机网易云 App 扫码并在手机上确认。
 
-**没有 cookie 也能用**，只是搜索结果的正式版会被隐藏，以翻唱为主。
+**手动填写**
 
-### 壁纸与头像
+1. 浏览器登录 music.163.com
+2. 按 F12 打开开发者工具，进入 Application 页面
+3. 在 Cookies 里找到 `MUSIC_U`，复制它的值
+4. 打开 `tools/xiaozhi-console/cookie.txt`，粘贴成 `MUSIC_U=你的值`
 
-访问 `http://<板子IP>/`（板子自带网页），或控制台首页：
+保存后重启控制台即可生效。
 
-- **壁纸**：裁成 210×248，浏览器端转标准 JPEG 后上传
-- **头像**：裁成 52×52，同样在浏览器端预处理
+不登录也能正常使用，只是部分歌曲搜不到原版，播放也会受限。
 
-两者都在上传时完成裁剪与格式转换，板子只负责解码 + 抖动，因此手机相册里任意格式都能传。
+### 上传壁纸和头像
+
+两种入口都可以：控制台首页，或直接用手机访问板子的 IP 地址。
+
+选好图片点上传就行，程序会自动裁剪尺寸。壁纸会铺满主页左侧，头像会显示在播放器的唱片中心。
+
+### 点歌
+
+控制台可以直接搜索并播放。搜索时带上歌手名，更容易选到想听的原唱。
 
 ---
 
 ## 目录结构
 
 ```
-├── main/
-│   ├── application.cc              # 主流程：音乐播放、对话状态机
-│   ├── audio/                      # 编解码、AFE、音频服务
-│   ├── display/                    # LVGL 显示抽象
-│   └── boards/waveshare-s3-rlcd-4.2/
-│       ├── custom_lcd_display.*    # 板级显示类
-│       ├── weather_ui.cc           # 主页（壁纸 + 时间 + 提醒）
-│       ├── music_ui.cc             # 播放器页
-│       ├── memo_ui.cc              # 备忘录页
-│       ├── data_update_task.cc     # 后台刷新（时间/电量/传感器）
-│       └── managers/
-│           ├── photo_loader.*      # 壁纸解码 + 抖动 + NVS
-│           ├── avatar_loader.*     # 头像解码 + 抖动 + NVS
-│           ├── photo_web_server.*  # 板子网页（上传/删除）
-│           └── reminder_manager.*  # 备忘录与定时提醒
-├── tools/xiaozhi-console/          # Java 控制台（Spring Boot）
-│   └── src/main/java/com/xiaozhi/console/
-│       ├── service/NeteaseService  # 网易云搜索/播放/扫码登录
-│       ├── service/DeviceService   # 板子通信（HTTP + UDP 发现）
-│       └── web/                    # REST 接口与前端页面
-└── docs/                           # 开发文档、踩坑记录
+main/
+├── application.cc                    主流程与播放控制
+├── audio/                            音频编解码与语音处理
+├── display/                          显示抽象层
+└── boards/waveshare-s3-rlcd-4.2/
+    ├── custom_lcd_display.cc         板级显示实现
+    ├── weather_ui.cc                 天气站页
+    ├── music_ui.cc                   播放器页
+    ├── memo_ui.cc                    备忘录页
+    ├── data_update_task.cc           后台数据刷新
+    └── managers/
+        ├── photo_loader.cc           壁纸处理
+        ├── avatar_loader.cc          头像处理
+        ├── photo_web_server.cc       板子网页服务
+        └── reminder_manager.cc       备忘录与提醒
+
+tools/xiaozhi-console/                Java 控制台
+├── service/NeteaseService.java       网易云接口
+├── service/DeviceService.java        与板子通信
+└── web/                              接口与页面
+
+docs/                                 开发文档
 ```
 
 ---
 
 ## 常见问题
 
-<details>
-<summary><b>烧录后黑屏 / 白屏</b></summary>
+**开机后屏幕不亮**
 
-确认屏幕排线插紧，且固件是 `waveshare-s3-rlcd-4.2` 板型。查看串口日志是否有 `LCD` 初始化失败。
-</details>
+检查屏幕排线是否插紧，以及烧录的固件是否为 `waveshare-s3-rlcd-4.2` 板型。
 
-<details>
-<summary><b>播放音乐时喊唤醒词没反应</b></summary>
+**播放音乐时唤不醒**
 
-已在 v2 修复（播放期间保持麦克风开启 + 预留内部 RAM 给 AFE）。若仍失效，检查串口日志的 `free sram` 是否低于 20 KB。
-</details>
+请更新到最新固件。如果仍然出现，查看串口日志里的可用内存，正常应该在 25 KB 以上。
 
-<details>
-<summary><b>控制台报 <code>UnsupportedClassVersionError</code></b></summary>
+**控制台打不开，提示 Java 版本错误**
 
-用了低于 Java 17 的运行时。`start.bat` 会自动扫描并选择最高版本的 Java 17+，如果机器上只有 Java 8 会提示下载地址。
-</details>
+需要 Java 17 或更高版本。启动脚本会自动寻找本机可用的 Java，如果只装了 Java 8，会给出下载地址。
 
-<details>
-<summary><b>搜出来的不是原唱</b></summary>
+**搜不到原唱**
 
-搜索时**带上歌手名**命中率最高（例：`放宇多田光的 One Last Kiss`）。系统会先用歌手名做硬过滤，再在结果里选正式版。
-</details>
+搜索时把歌手名一起说，例如「放宇多田光的 One Last Kiss」，比只搜歌名准确得多。
 
-<details>
-<summary><b>上传图片提示"解不开"</b></summary>
+**上传图片提示解不开**
 
-网页上传会自动转成标准 baseline JPEG。若仍失败，多半是图片本身损坏，换一张试试。
-</details>
+换一张图片试试。网页上传时会自动转换格式，大部分情况是图片文件本身有问题。
+
+**忘记 Wi-Fi 密码或换了路由器**
+
+长按按键重新进入配网模式。
 
 ---
 
 ## 致谢
 
-- [xiaozhi-esp32](https://github.com/78/xiaozhi-esp32) —— 语音助手框架
-- [ESP-SR](https://github.com/espressif/esp-sr) —— 离线唤醒与语音前端
-- [LVGL](https://github.com/lvgl/lvgl) —— 图形库
-- [ZhouhaoJiang/xiaozhi-esp32](https://github.com/ZhouhaoJiang/xiaozhi-esp32) —— RLCD 板级适配参考
+本项目基于以下开源工作：
+
+- [xiaozhi-esp32](https://github.com/78/xiaozhi-esp32) — 语音助手框架
+- [ESP-SR](https://github.com/espressif/esp-sr) — 离线唤醒与语音处理
+- [LVGL](https://github.com/lvgl/lvgl) — 图形界面库
+- [ZhouhaoJiang/xiaozhi-esp32](https://github.com/ZhouhaoJiang/xiaozhi-esp32) — RLCD 屏幕适配参考
 
 ## 许可证
 
