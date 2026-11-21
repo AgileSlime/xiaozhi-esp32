@@ -40,3 +40,6 @@ tools/set-github-token.ps1
 build-log.txt
 build_memo.log
 *.log
+
+# CI 配置不属于设备项目本身
+.github/workflows/
