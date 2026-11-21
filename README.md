@@ -1,173 +1,185 @@
-# An MCP-based Chatbot
+# 小智 RLCD 桌面摆件
 
-(English | [中文](README_zh.md) | [日本語](README_ja.md))
+> 基于 ESP32-S3 的 4.2 英寸黑白反射屏 AI 桌面助手：语音对话、网易云音乐、歌词滚动、备忘录提醒、自定义壁纸与头像。
 
-## Introduction
+一块 400×300 的单色 RLCD 屏，不需要背光也能看清。开机是桌面摆件，说话时是语音助手，放歌时是歌词机。
 
-👉 [Human: Give AI a camera vs AI: Instantly finds out the owner hasn't washed hair for three days【bilibili】](https://www.bilibili.com/video/BV1bpjgzKEhd/)
+---
 
-👉 [Handcraft your AI girlfriend, beginner's guide【bilibili】](https://www.bilibili.com/video/BV1XnmFYLEJN/)
+## 功能
 
-As a voice interaction entry, the XiaoZhi AI chatbot leverages the AI capabilities of large models like Qwen / DeepSeek, and achieves multi-terminal control via the MCP protocol.
+### 语音助手
 
-<img src="docs/mcp-based-graph.jpg" alt="Control everything via MCP" width="320">
+- 离线唤醒词 **「你好小智」**（ESP-SR WakeNet9，不联网也能唤醒）
+- 播放音乐时**同样可唤醒**（麦克风常开，不与音频输出抢通道）
+- 流式 ASR → LLM → TTS，支持打断
+- 按键强制对话（唤醒词失效时的兜底）
 
-## Version Notes
+### 音乐播放
 
-The current v2 version is incompatible with the v1 partition table, so it is not possible to upgrade from v1 to v2 via OTA. For partition table details, see [partitions/v2/README.md](partitions/v2/README.md).
+- 网易云搜索与播放，配置 cookie 后可播 VIP 曲目
+- **原唱优先**：先按歌手硬过滤，再按歌名/时长/翻唱标记打分
+- LRC 歌词三行滚动，当前句黑底白字反白
+- 唱片中心头像支持自定义（1-bit 点阵，网页上传）
+- 静态唱片（不做旋转动画，把 CPU 让给音频解码）
 
-All hardware running v1 can be upgraded to v2 by manually flashing the firmware.
+### 桌面
 
-The stable version of v1 is 1.9.2. You can switch to v1 by running `git checkout v1`. The v1 branch will be maintained until February 2026.
+| 页面 | 内容 |
+|---|---|
+| 天气站 | 自定义壁纸、时间日期、室内温湿度、备忘录列表 |
+| 备忘录 | 分页浏览、定时提醒 |
+| 播放器 | 唱片 + 头像、曲名歌手、歌词、进度条、控制键 |
 
-### Features Implemented
+- 壁纸：网页上传，210×248 抖动成 1-bit，存 NVS，重启不丢
+- 头像：网页上传，52×52 抖动成 1-bit，存独立 NVS
+- 提醒：到点自动切回主页并**连响 3 次**
 
-- Wi-Fi / ML307 Cat.1 4G
-- Offline voice wake-up [ESP-SR](https://github.com/espressif/esp-sr)
-- Supports two communication protocols ([Websocket](docs/websocket.md) or MQTT+UDP)
-- Uses OPUS audio codec
-- Voice interaction based on streaming ASR + LLM + TTS architecture
-- Speaker recognition, identifies the current speaker [3D Speaker](https://github.com/modelscope/3D-Speaker)
-- OLED / LCD display, supports emoji display
-- Battery display and power management
-- Multi-language support (Chinese, English, Japanese)
-- Supports ESP32-C3, ESP32-S3, ESP32-P4 chip platforms
-- Device-side MCP for device control (Speaker, LED, Servo, GPIO, etc.)
-- Cloud-side MCP to extend large model capabilities (smart home control, PC desktop operation, knowledge search, email, etc.)
-- Customizable wake words, fonts, emojis, and chat backgrounds with online web-based editing ([Custom Assets Generator](https://github.com/78/xiaozhi-assets-generator))
+---
 
-## Hardware
+## 硬件
 
-### Breadboard DIY Practice
+| 项目 | 规格 |
+|---|---|
+| 主控 | ESP32-S3（16 MB Flash / 8 MB PSRAM） |
+| 屏幕 | 4.2 英寸 RLCD，400×300，单色（1-bit） |
+| 音频 | ES8311 编解码器 + 双麦克风 + 扬声器 |
+| 存储 | 可选 microSD（壁纸目录 `/sdcard/photos`） |
+| 供电 | USB-C |
 
-See the Feishu document tutorial:
+开发板型号：`waveshare-s3-rlcd-4.2`
 
-👉 ["XiaoZhi AI Chatbot Encyclopedia"](https://ccnphfhqs21z.feishu.cn/wiki/F5krwD16viZoF0kKkvDcrZNYnhb?from=from_copylink)
+---
 
-Breadboard demo:
+## 快速开始
 
-![Breadboard Demo](docs/v1/wiring2.jpg)
+### 1. 烧录固件
 
-### Supports 70+ Open Source Hardware (Partial List)
+需要 [ESP-IDF v5.5](https://docs.espressif.com/projects/esp-idf/zh_CN/latest/esp32s3/get-started/) 环境。
 
-- <a href="https://oshwhub.com/li-chuang-kai-fa-ban/li-chuang-shi-zhan-pai-esp32-s3-kai-fa-ban" target="_blank" title="LiChuang ESP32-S3 Development Board">LiChuang ESP32-S3 Development Board</a>
-- <a href="https://github.com/espressif/esp-box" target="_blank" title="Espressif ESP32-S3-BOX3">Espressif ESP32-S3-BOX3</a>
-- <a href="https://docs.m5stack.com/zh_CN/core/CoreS3" target="_blank" title="M5Stack CoreS3">M5Stack CoreS3</a>
-- <a href="https://docs.m5stack.com/en/atom/Atomic%20Echo%20Base" target="_blank" title="AtomS3R + Echo Base">M5Stack AtomS3R + Echo Base</a>
-- <a href="https://gf.bilibili.com/item/detail/1108782064" target="_blank" title="Magic Button 2.4">Magic Button 2.4</a>
-- <a href="https://www.waveshare.net/shop/ESP32-S3-Touch-AMOLED-1.8.htm" target="_blank" title="Waveshare ESP32-S3-Touch-AMOLED-1.8">Waveshare ESP32-S3-Touch-AMOLED-1.8</a>
-- <a href="https://github.com/Xinyuan-LilyGO/T-Circle-S3" target="_blank" title="LILYGO T-Circle-S3">LILYGO T-Circle-S3</a>
-- <a href="https://oshwhub.com/tenclass01/xmini_c3" target="_blank" title="XiaGe Mini C3">XiaGe Mini C3</a>
-- <a href="https://oshwhub.com/movecall/cuican-ai-pendant-lights-up-y" target="_blank" title="Movecall CuiCan ESP32S3">CuiCan AI Pendant</a>
-- <a href="https://github.com/WMnologo/xingzhi-ai" target="_blank" title="WMnologo-Xingzhi-1.54">WMnologo-Xingzhi-1.54TFT</a>
-- <a href="https://www.seeedstudio.com/SenseCAP-Watcher-W1-A-p-5979.html" target="_blank" title="SenseCAP Watcher">SenseCAP Watcher</a>
-- <a href="https://www.bilibili.com/video/BV1BHJtz6E2S/" target="_blank" title="ESP-HI Low Cost Robot Dog">ESP-HI Low Cost Robot Dog</a>
+```bash
+idf.py set-target esp32s3
+idf.py build
+```
 
-<div style="display: flex; justify-content: space-between;">
-  <a href="docs/v1/lichuang-s3.jpg" target="_blank" title="LiChuang ESP32-S3 Development Board">
-    <img src="docs/v1/lichuang-s3.jpg" width="240" />
-  </a>
-  <a href="docs/v1/espbox3.jpg" target="_blank" title="Espressif ESP32-S3-BOX3">
-    <img src="docs/v1/espbox3.jpg" width="240" />
-  </a>
-  <a href="docs/v1/m5cores3.jpg" target="_blank" title="M5Stack CoreS3">
-    <img src="docs/v1/m5cores3.jpg" width="240" />
-  </a>
-  <a href="docs/v1/atoms3r.jpg" target="_blank" title="AtomS3R + Echo Base">
-    <img src="docs/v1/atoms3r.jpg" width="240" />
-  </a>
-  <a href="docs/v1/magiclick.jpg" target="_blank" title="Magic Button 2.4">
-    <img src="docs/v1/magiclick.jpg" width="240" />
-  </a>
-  <a href="docs/v1/waveshare.jpg" target="_blank" title="Waveshare ESP32-S3-Touch-AMOLED-1.8">
-    <img src="docs/v1/waveshare.jpg" width="240" />
-  </a>
-  <a href="docs/v1/lilygo-t-circle-s3.jpg" target="_blank" title="LILYGO T-Circle-S3">
-    <img src="docs/v1/lilygo-t-circle-s3.jpg" width="240" />
-  </a>
-  <a href="docs/v1/xmini-c3.jpg" target="_blank" title="XiaGe Mini C3">
-    <img src="docs/v1/xmini-c3.jpg" width="240" />
-  </a>
-  <a href="docs/v1/movecall-cuican-esp32s3.jpg" target="_blank" title="CuiCan">
-    <img src="docs/v1/movecall-cuican-esp32s3.jpg" width="240" />
-  </a>
-  <a href="docs/v1/wmnologo_xingzhi_1.54.jpg" target="_blank" title="WMnologo-Xingzhi-1.54">
-    <img src="docs/v1/wmnologo_xingzhi_1.54.jpg" width="240" />
-  </a>
-  <a href="docs/v1/sensecap_watcher.jpg" target="_blank" title="SenseCAP Watcher">
-    <img src="docs/v1/sensecap_watcher.jpg" width="240" />
-  </a>
-  <a href="docs/v1/esp-hi.jpg" target="_blank" title="ESP-HI Low Cost Robot Dog">
-    <img src="docs/v1/esp-hi.jpg" width="240" />
-  </a>
-</div>
+仓库根目录提供了一键烧录脚本（Windows）：
 
-## Software
+```bat
+flash.bat
+```
 
-### Firmware Flashing
+### 2. 配网
 
-For beginners, it is recommended to use the firmware that can be flashed without setting up a development environment.
+首次开机自动进入配网模式（`78/xiaozhi-esp32` 配网协议），用手机连接设备热点后填写 WiFi 信息。
 
-The firmware connects to the official [xiaozhi.me](https://xiaozhi.me) server by default. Personal users can register an account to use the Qwen real-time model for free.
+### 3. 启动控制台（可选，但强烈推荐）
 
-👉 [Beginner's Firmware Flashing Guide](https://ccnphfhqs21z.feishu.cn/wiki/Zpz4wXBtdimBrLk25WdcXzxcnNS)
+控制台提供网易云登录、壁纸/头像上传、点歌等能力。
 
-### Development Environment
+```bat
+tools\xiaozhi-console\start.bat
+```
 
-- Cursor or VSCode
-- Install ESP-IDF plugin, select SDK version 5.4 or above
-- Linux is better than Windows for faster compilation and fewer driver issues
-- This project uses Google C++ code style, please ensure compliance when submitting code
+- 浏览器自动打开 `http://localhost:8800`
+- 需要 **Java 17 或更高**（脚本会自动扫描全盘寻找，不依赖 `JAVA_HOME`）
+- 板子与电脑在同一局域网即可，控制台通过 UDP 广播自动发现
 
-### Developer Documentation
+---
 
-- [Custom Board Guide](docs/custom-board.md) - Learn how to create custom boards for XiaoZhi AI
-- [MCP Protocol IoT Control Usage](docs/mcp-usage.md) - Learn how to control IoT devices via MCP protocol
-- [MCP Protocol Interaction Flow](docs/mcp-protocol.md) - Device-side MCP protocol implementation
-- [MQTT + UDP Hybrid Communication Protocol Document](docs/mqtt-udp.md)
-- [A detailed WebSocket communication protocol document](docs/websocket.md)
+## 控制台
 
-## Large Model Configuration
+### 网易云登录
 
-If you already have a XiaoZhi AI chatbot device and have connected to the official server, you can log in to the [xiaozhi.me](https://xiaozhi.me) console for configuration.
+三种方式，任选其一：
 
-👉 [Backend Operation Video Tutorial (Old Interface)](https://www.bilibili.com/video/BV1jUCUY2EKM/)
+1. **扫码登录**：控制台首页「网易云登录」→ 生成二维码 → 手机网易云 App 扫码确认
+2. **手动贴 cookie**：浏览器登录 [music.163.com](https://music.163.com)，F12 → Application → Cookies → 复制 `MUSIC_U` 的值，写入 `tools/xiaozhi-console/cookie.txt`
+3. **整行 Cookie**：F12 → Network → 任意请求 → Request Headers → 复制整行 `Cookie`
 
-## Related Open Source Projects
+> `MUSIC_U` 是 **HttpOnly** cookie，`document.cookie` 读不到，必须从 Application 面板或请求头获取。
 
-For server deployment on personal computers, refer to the following open-source projects:
+**没有 cookie 也能用**，只是搜索结果的正式版会被隐藏，以翻唱为主。
 
-- [xinnan-tech/xiaozhi-esp32-server](https://github.com/xinnan-tech/xiaozhi-esp32-server) Python server
-- [joey-zhou/xiaozhi-esp32-server-java](https://github.com/joey-zhou/xiaozhi-esp32-server-java) Java server
-- [AnimeAIChat/xiaozhi-server-go](https://github.com/AnimeAIChat/xiaozhi-server-go) Golang server
-- [hackers365/xiaozhi-esp32-server-golang](https://github.com/hackers365/xiaozhi-esp32-server-golang) Golang server
+### 壁纸与头像
 
-Other client projects using the XiaoZhi communication protocol:
+访问 `http://<板子IP>/`（板子自带网页），或控制台首页：
 
-- [huangjunsen0406/py-xiaozhi](https://github.com/huangjunsen0406/py-xiaozhi) Python client
-- [TOM88812/xiaozhi-android-client](https://github.com/TOM88812/xiaozhi-android-client) Android client
-- [100askTeam/xiaozhi-linux](http://github.com/100askTeam/xiaozhi-linux) Linux client by 100ask
-- [78/xiaozhi-sf32](https://github.com/78/xiaozhi-sf32) Bluetooth chip firmware by Sichuan
-- [QuecPython/solution-xiaozhiAI](https://github.com/QuecPython/solution-xiaozhiAI) QuecPython firmware by Quectel
+- **壁纸**：裁成 210×248，浏览器端转标准 JPEG 后上传
+- **头像**：裁成 52×52，同样在浏览器端预处理
 
-Custom Assets Tools:
+两者都在上传时完成裁剪与格式转换，板子只负责解码 + 抖动，因此手机相册里任意格式都能传。
 
-- [78/xiaozhi-assets-generator](https://github.com/78/xiaozhi-assets-generator) Custom Assets Generator (Wake words, fonts, emojis, backgrounds)
+---
 
-## About the Project
+## 目录结构
 
-This is an open-source ESP32 project, released under the MIT license, allowing anyone to use it for free, including for commercial purposes.
+```
+├── main/
+│   ├── application.cc              # 主流程：音乐播放、对话状态机
+│   ├── audio/                      # 编解码、AFE、音频服务
+│   ├── display/                    # LVGL 显示抽象
+│   └── boards/waveshare-s3-rlcd-4.2/
+│       ├── custom_lcd_display.*    # 板级显示类
+│       ├── weather_ui.cc           # 主页（壁纸 + 时间 + 提醒）
+│       ├── music_ui.cc             # 播放器页
+│       ├── memo_ui.cc              # 备忘录页
+│       ├── data_update_task.cc     # 后台刷新（时间/电量/传感器）
+│       └── managers/
+│           ├── photo_loader.*      # 壁纸解码 + 抖动 + NVS
+│           ├── avatar_loader.*     # 头像解码 + 抖动 + NVS
+│           ├── photo_web_server.*  # 板子网页（上传/删除）
+│           └── reminder_manager.*  # 备忘录与定时提醒
+├── tools/xiaozhi-console/          # Java 控制台（Spring Boot）
+│   └── src/main/java/com/xiaozhi/console/
+│       ├── service/NeteaseService  # 网易云搜索/播放/扫码登录
+│       ├── service/DeviceService   # 板子通信（HTTP + UDP 发现）
+│       └── web/                    # REST 接口与前端页面
+└── docs/                           # 开发文档、踩坑记录
+```
 
-We hope this project helps everyone understand AI hardware development and apply rapidly evolving large language models to real hardware devices.
+---
 
-If you have any ideas or suggestions, please feel free to raise Issues or join our [Discord](https://discord.gg/bXqgAfRm) or QQ group: 994694848
+## 常见问题
 
-## Star History
+<details>
+<summary><b>烧录后黑屏 / 白屏</b></summary>
 
-<a href="https://star-history.com/#78/xiaozhi-esp32&Date">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=78/xiaozhi-esp32&type=Date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=78/xiaozhi-esp32&type=Date" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=78/xiaozhi-esp32&type=Date" />
- </picture>
-</a> 
+确认屏幕排线插紧，且固件是 `waveshare-s3-rlcd-4.2` 板型。查看串口日志是否有 `LCD` 初始化失败。
+</details>
+
+<details>
+<summary><b>播放音乐时喊唤醒词没反应</b></summary>
+
+已在 v2 修复（播放期间保持麦克风开启 + 预留内部 RAM 给 AFE）。若仍失效，检查串口日志的 `free sram` 是否低于 20 KB。
+</details>
+
+<details>
+<summary><b>控制台报 <code>UnsupportedClassVersionError</code></b></summary>
+
+用了低于 Java 17 的运行时。`start.bat` 会自动扫描并选择最高版本的 Java 17+，如果机器上只有 Java 8 会提示下载地址。
+</details>
+
+<details>
+<summary><b>搜出来的不是原唱</b></summary>
+
+搜索时**带上歌手名**命中率最高（例：`放宇多田光的 One Last Kiss`）。系统会先用歌手名做硬过滤，再在结果里选正式版。
+</details>
+
+<details>
+<summary><b>上传图片提示"解不开"</b></summary>
+
+网页上传会自动转成标准 baseline JPEG。若仍失败，多半是图片本身损坏，换一张试试。
+</details>
+
+---
+
+## 致谢
+
+- [xiaozhi-esp32](https://github.com/78/xiaozhi-esp32) —— 语音助手框架
+- [ESP-SR](https://github.com/espressif/esp-sr) —— 离线唤醒与语音前端
+- [LVGL](https://github.com/lvgl/lvgl) —— 图形库
+- [ZhouhaoJiang/xiaozhi-esp32](https://github.com/ZhouhaoJiang/xiaozhi-esp32) —— RLCD 板级适配参考
+
+## 许可证
+
+MIT

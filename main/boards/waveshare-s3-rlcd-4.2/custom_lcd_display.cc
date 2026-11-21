@@ -103,7 +103,9 @@ CustomLcdDisplay::CustomLcdDisplay(esp_lcd_panel_io_handle_t panel_io,
     SetupWeatherUI();
     SetupMemoUI();
     SetupMusicUI();
-    // 对话浮层必须最后创建：它是三页之上的覆盖层，z 序要在最上面
+    // 对话小卡：每页一张，建在各自页面内部，平时隐藏
+    SetupPageChatWindows();
+    // 放大的对话记录层必须最后创建：它是三页之上的覆盖层，z 序要在最上面
     SetupChatOverlay();
     // 告诉显示框架：当前自定义 UI 已经初始化完成
     // 否则基类的 SetStatus/ShowNotification 会一直误判为“UI 未准备好”
@@ -229,7 +231,8 @@ void CustomLcdDisplay::SetChatMessage(const char* role, const char* content) {
         UpdateHomeBottomCard(static_cast<int>(Application::GetInstance().GetDeviceState()));
     }
 
-    // 同一条消息也进对话浮层：不管当前停在哪个页面，说话时都能看到最近三轮
+    // 同一条消息进对话记录：三页的对话小卡各自刷新一次。
+    // 放大的全屏层不会自己冒出来，只有用户说了「放大对话列表」才打开。
     AppendChatTurnInternal(role, content);
 
     // 音乐页仍保留原样文字显示
@@ -295,6 +298,9 @@ void CustomLcdDisplay::SetEmotion(const char* emotion) {
     if (music_emotion_img_) {
         lv_obj_add_flag(music_emotion_img_, LV_OBJ_FLAG_HIDDEN);
     }
+
+    // 播放器页唱片中心：头像跟随服务端表情（assets 里的 emoji，官网可换表情包）
+    SetMusicAvatar(emotion);
 }
 
 void CustomLcdDisplay::ClearChatMessages() {
@@ -369,10 +375,12 @@ void CustomLcdDisplay::CycleDisplayMode() {
 // 已经搬到 music_ui.cc，和版式常量放在一起，改布局不用跨文件。
 void CustomLcdDisplay::SwitchToMusicPage() {
     DisplayLockGuard lock(this);
-    // 放歌是个"要看结果"的动作：收起对话浮层，把播放器页让出来。
-    // 标记这一轮已经跳页，AI 后面开始说话时不会再把浮层顶回来。
+    // 放歌是个"要看结果"的动作：把对话小卡和放大层都收起来，把播放器页让出来。
+    // 标记这一轮已经跳页，AI 后面开始说话时不会再把它们顶回来。
     tool_jumped_this_turn_ = true;
+    chat_overlay_pinned_ = false;
     SetChatOverlayVisibleInternal(false);
+    SetPageChatWindowsVisibleInternal(false);
     if (display_mode_ != MODE_MUSIC) {
         display_mode_ = MODE_MUSIC;
         ApplyDisplayMode();
@@ -383,7 +391,9 @@ void CustomLcdDisplay::SwitchToMusicPage() {
 void CustomLcdDisplay::SwitchToWeatherPage() {
     DisplayLockGuard lock(this);
     tool_jumped_this_turn_ = true;
+    chat_overlay_pinned_ = false;
     SetChatOverlayVisibleInternal(false);
+    SetPageChatWindowsVisibleInternal(false);
     if (display_mode_ != MODE_WEATHER) {
         display_mode_ = MODE_WEATHER;
         ApplyDisplayMode();
@@ -506,8 +516,9 @@ void CustomLcdDisplay::UpdateHomeBottomCard(int device_state) {
                               ds == kDeviceStateSpeaking);
 
     // 以前这里会在"开始说话"时把备忘录页强制切回主页，否则看不到识别文字。
-    // 现在识别文字进的是全屏对话浮层，浮层盖得住任何页面，
-    // 所以不再抢用户的页面切换——停在备忘录页听完话，还停在备忘录页。
+    // 现在每页都有自己的对话小卡（备忘录页和播放器页盖在本页内容上，
+    // 天气页就是这个 voice_card_），所以不再抢用户的页面切换——
+    // 停在备忘录页听完话，还停在备忘录页。
 
     // system 提示临时占用（例如"音量已调到 50%"），到期自动收回
     const uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;

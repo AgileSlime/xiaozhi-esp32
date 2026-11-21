@@ -1,0 +1,33 @@
+server:
+  port: 8800
+  servlet:
+    encoding:
+      charset: UTF-8
+      force: true
+
+spring:
+  application:
+    name: xiaozhi-console
+  servlet:
+    multipart:
+      max-file-size: 12MB
+      max-request-size: 12MB
+  mvc:
+    async:
+      request-timeout: 0
+
+logging:
+  level:
+    root: INFO
+    com.xiaozhi.console: INFO
+
+xiaozhi:
+  # 板子默认端口（网页服务固定 80）
+  device-port: 80
+  # 电脑广播自己中转地址用的端口，和固件里的 MusicRelayDiscovery 一致，别改
+  broadcast-port: 8801
+  ack-port: 8802
+  # 网易云 cookie 文件：浏览器登录 music.163.com 后把 Cookie 整行粘进去
+  cookie-file: cookie.txt
+  # 广播间隔（毫秒）
+  broadcast-interval-ms: 3000

@@ -270,6 +270,7 @@ MusicStream::Resolved MusicStream::Play(const std::string& keyword) {
     }
     r.url = JsonStr(root, "url");
     r.lyric = JsonStr(root, "lyric");
+    r.cover = JsonStr(root, "cover");
 
     cJSON_Delete(root);
 

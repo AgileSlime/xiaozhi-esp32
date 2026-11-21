@@ -45,6 +45,7 @@ public:
         Song song;
         std::string url;         // MP3 明文直链
         std::string lyric;       // LRC 原文
+        std::string cover;       // 专辑封面图 URL（可为空）
     };
 
     static MusicStream& GetInstance();

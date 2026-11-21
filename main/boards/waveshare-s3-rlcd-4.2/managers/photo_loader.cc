@@ -8,6 +8,8 @@
 
 #include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <nvs.h>
+#include <nvs_flash.h>
 
 #include "esp_jpeg_dec.h"
 #include "../assets/default_photo.h"
@@ -195,10 +197,15 @@ bool HomePhoto::RenderFromJpeg(const uint8_t* jpg, size_t file_len, const char* 
     // 主页照片位只有 width×height（210×248），而手机原图动辄 4000×3000。
     // 以前固定只缩一半：2000×1500 的 RGB888 解码缓冲要 9MB，8MB PSRAM 直接分配失败，
     // 表现出来的就是"图明明传进去了，主页还是默认壁纸"。
-    // esp_jpeg 最高支持 1/8，这里按"缩完仍明显大于目标"来挑最大档位，
-    // 把解码缓冲压到几百 KB。留 1.25 倍余量是给后面的区域平均取样用的。
-    const int need_w = width + width / 4;
-    const int need_h = height + height / 4;
+    // esp_jpeg 最高支持 1/8，这里按"缩完不小于目标"来挑最大档位，把解码缓冲压到最小。
+    //
+    // 注意：以前这里留了 1.25 倍余量（need = width + width/4），结果 420×496 这种
+    // 最常见的中等图反而不缩，要硬解 625KB RGB888。WiFi 一起工作时 PSRAM 一紧张就
+    // 分配失败——表现就是"有线能传、无线报 422 解不开"。现在改成 1:1 目标即可缩，
+    // 420×496 正好缩 1/2 解成 210×248，内存从 625KB 降到 156KB，且 box filter
+    // 退化成 1:1 取样，画质无损。
+    const int need_w = width;
+    const int need_h = height;
     int scale_div = 1;
     for (int d = 2; d <= 8; d *= 2) {
         if (src_w / d >= need_w && src_h / d >= need_h) {
@@ -230,73 +237,131 @@ bool HomePhoto::RenderFromJpeg(const uint8_t* jpg, size_t file_len, const char* 
         }
     }
 
-    // ---- 第二遍：真解码 ----
-    jpeg_dec_handle_t dec = nullptr;
-    if (jpeg_dec_open(&cfg, &dec) != JPEG_ERR_OK) {
-        ESP_LOGE(TAG, "JPEG 解码器初始化失败（第二遍）");
-        return false;
-    }
-
-    jpeg_dec_io_t io = {};
-    io.inbuf = const_cast<uint8_t*>(jpg);
-    io.inbuf_len = static_cast<int>(file_len);
-    io.inbuf_remain = static_cast<int>(file_len);
-
-    jpeg_dec_header_info_t info = {};
-    if (jpeg_dec_parse_header(dec, &io, &info) != JPEG_ERR_OK) {
-        ESP_LOGE(TAG, "JPEG 头解析失败（第二遍）");
-        jpeg_dec_close(dec);
-        return false;
-    }
-
+    // ---- 第二遍：真解码（PSRAM 分配失败时自动降档重试）----
+    // WiFi 活动时 PSRAM 会被驱动占掉一部分，同样的图有线能解、无线就分配失败，
+    // 用户看到的就是"解不开（422）"。这里在分配失败时把 scale 再降一档重来，
+    // 最多降到 1/8，保证只要 PSRAM 还有一点余量就能把图解出来。
+    uint8_t* rgb = nullptr;
     int out_len = 0;
-    if (jpeg_dec_get_outbuf_len(dec, &out_len) != JPEG_ERR_OK || out_len <= 0) {
-        ESP_LOGE(TAG, "拿不到解码输出长度");
-        jpeg_dec_close(dec);
-        return false;
-    }
+    {
+        jpeg_error_t derr = JPEG_ERR_FAIL;
+        int cur_div = scale_div;
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            if (attempt > 0) {
+                cur_div *= 2;
+                if (cur_div > 8) {
+                    break;
+                }
+                const int sw = (src_w / cur_div / 8) * 8;
+                const int sh = (src_h / cur_div / 8) * 8;
+                if (sw < 16 || sh < 16) {
+                    break;
+                }
+                cfg.scale.width = sw;
+                cfg.scale.height = sh;
+                ESP_LOGW(TAG, "解码缓冲不足，降档到 1/%d 重试（%dx%d）", cur_div, sw, sh);
+            }
 
-    uint8_t* rgb = static_cast<uint8_t*>(heap_caps_malloc(out_len, MALLOC_CAP_SPIRAM));
-    if (rgb == nullptr) {
-        ESP_LOGE(TAG, "解码缓冲分配失败（%d 字节）", out_len);
-        jpeg_dec_close(dec);
-        return false;
-    }
+            jpeg_dec_handle_t dec = nullptr;
+            if (jpeg_dec_open(&cfg, &dec) != JPEG_ERR_OK) {
+                ESP_LOGE(TAG, "JPEG 解码器初始化失败（第二遍）");
+                break;
+            }
 
-    io.outbuf = rgb;
-    const jpeg_error_t derr = jpeg_dec_process(dec, &io);
-    jpeg_dec_close(dec);
+            jpeg_dec_io_t io = {};
+            io.inbuf = const_cast<uint8_t*>(jpg);
+            io.inbuf_len = static_cast<int>(file_len);
+            io.inbuf_remain = static_cast<int>(file_len);
 
-    if (derr != JPEG_ERR_OK) {
-        ESP_LOGE(TAG, "JPEG 解码失败 (err=%d)", static_cast<int>(derr));
-        heap_caps_free(rgb);
-        return false;
+            jpeg_dec_header_info_t info = {};
+            if (jpeg_dec_parse_header(dec, &io, &info) != JPEG_ERR_OK) {
+                ESP_LOGE(TAG, "JPEG 头解析失败（第二遍）");
+                jpeg_dec_close(dec);
+                break;
+            }
+
+            int this_len = 0;
+            if (jpeg_dec_get_outbuf_len(dec, &this_len) != JPEG_ERR_OK || this_len <= 0) {
+                ESP_LOGE(TAG, "拿不到解码输出长度");
+                jpeg_dec_close(dec);
+                break;
+            }
+
+            // esp_jpeg 要求输出缓冲 16 字节对齐；heap_caps_malloc 不保证，
+            // 不对齐会直接报 err=-4 "Output buffer address is not 16-byte aligned"。
+            uint8_t* buf = static_cast<uint8_t*>(
+                    heap_caps_aligned_alloc(16, static_cast<size_t>(this_len), MALLOC_CAP_SPIRAM));
+            if (buf == nullptr) {
+                ESP_LOGW(TAG, "解码缓冲分配失败（需 %d 字节，PSRAM 剩余 %u），降档重试",
+                         this_len,
+                         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+                jpeg_dec_close(dec);
+                continue;   // 降一档再来
+            }
+
+            io.outbuf = buf;
+            derr = jpeg_dec_process(dec, &io);
+            jpeg_dec_close(dec);
+            if (derr != JPEG_ERR_OK) {
+                ESP_LOGE(TAG, "JPEG 解码失败 (err=%d)", static_cast<int>(derr));
+                heap_caps_free(buf);
+                break;
+            }
+            rgb = buf;
+            out_len = this_len;
+            break;
+        }
+        if (rgb == nullptr) {
+            return false;
+        }
     }
 
     // ---- 反推解码后的实际宽高 ----
-    // scale 只保证"8 的倍数"，实际输出可能和请求值略有出入，
-    // 所以用输出字节数 + 原图宽高比反推，避免采样时踩到行尾。
+    // 这里必须精确：宽高错一个像素，后面按行采样就会整幅错位
+    // （表现出来就是"显示的是图片局部、画面糊成一团"）。
+    //
+    // 策略：先按"原图尺寸 / 缩放档位"的整数候选逐个校验（能整除 out_pixels
+    // 的那组就是真实宽高），全部不中才退回按比例估算。
     const int out_pixels = out_len / 3;
     const double ratio = static_cast<double>(src_w) / static_cast<double>(src_h);
-    int ow = static_cast<int>(std::lround(std::sqrt(static_cast<double>(out_pixels) * ratio)));
-    if (ow <= 0) {
-        heap_caps_free(rgb);
-        return false;
+    int ow = 0;
+    int oh = 0;
+    for (int d = 1; d <= 8 && ow == 0; d *= 2) {
+        const int cw = src_w / d;
+        const int ch = src_h / d;
+        const int candidates[2][2] = {
+                {cw, ch},                            // 直接整除
+                {(cw / 8) * 8, (ch / 8) * 8},        // 8 对齐版本
+        };
+        for (int k = 0; k < 2; ++k) {
+            const long w = candidates[k][0];
+            const long h = candidates[k][1];
+            if (w >= 8 && h >= 8 && w * h == out_pixels) {
+                ow = static_cast<int>(w);
+                oh = static_cast<int>(h);
+                break;
+            }
+        }
     }
-    int oh = out_pixels / ow;
+    if (ow == 0) {
+        // 兜底：按原图宽高比估算
+        ow = static_cast<int>(std::lround(std::sqrt(static_cast<double>(out_pixels) * ratio)));
+        if (ow <= 0) {
+            heap_caps_free(rgb);
+            return false;
+        }
+        oh = out_pixels / ow;
+        while (static_cast<long>(ow) * oh > out_pixels) {
+            oh -= 1;
+            if (oh <= 0) break;
+        }
+    }
     if (oh <= 0 || ow < 8) {
         heap_caps_free(rgb);
         return false;
     }
-    // 宽度可能差 1，按实际像素数修正
-    while (static_cast<long>(ow) * oh > out_pixels) {
-        oh -= 1;
-        if (oh <= 0) break;
-    }
-    if (oh <= 0) {
-        heap_caps_free(rgb);
-        return false;
-    }
+    ESP_LOGI(TAG, "解码输出尺寸推定 %dx%d（原图 %dx%d，%d 像素）",
+             ow, oh, src_w, src_h, out_pixels);
 
     if (EnsureBuffers(width, height) == false) {
         heap_caps_free(rgb);
@@ -681,7 +746,14 @@ bool HomePhoto::ApplyJpegMemory(const uint8_t* jpg, size_t len, int width, int h
     showing_default_ = false;
     current_index_ = -1;
     current_name_ = override_name_;
-    ESP_LOGI(TAG, "网页上传的图片已生效（不落 SD，重启恢复默认）");
+
+    // 顺手存 NVS：这样它就成了新的"默认图"，重启、拔电都还是它。
+    // 存失败也不影响这一次显示，只是重启后会退回上一张/内置图。
+    if (SaveOverrideLocked()) {
+        ESP_LOGI(TAG, "网页上传的图片已生效，并已存入 NVS（重启后仍是这张）");
+    } else {
+        ESP_LOGW(TAG, "网页上传的图片已生效，但写入 NVS 失败（重启后会恢复上一张）");
+    }
     return true;
 }
 
@@ -693,4 +765,171 @@ void HomePhoto::ClearOverride() {
 bool HomePhoto::HasOverride() const {
     std::lock_guard<std::mutex> lk(mutex_);
     return override_active_;
+}
+
+// ---------------------------------------------------------------- NVS 常驻
+
+namespace {
+// NVS 里这块数据的格式：魔数 + 宽 + 高 + 字节数 + 1bpp 位图本体
+constexpr const char* kNvsNamespace = "hphoto";
+constexpr const char* kNvsKey = "bmp";
+constexpr uint8_t kNvsMagic[4] = {'H', 'P', 'B', '1'};
+constexpr size_t kNvsHeader = 12;
+}  // namespace
+
+// 需已持锁
+bool HomePhoto::SaveOverrideLocked() {
+    if (!override_active_ || override_bits_ == nullptr ||
+        override_w_ <= 0 || override_h_ <= 0) {
+        return false;
+    }
+    const size_t stride = (static_cast<size_t>(override_w_) + 7) / 8;
+    const size_t bits = stride * static_cast<size_t>(override_h_);
+    if (bits == 0 || bits > override_bytes_) {
+        return false;
+    }
+
+    const size_t total = kNvsHeader + bits;
+    auto* blob = static_cast<uint8_t*>(heap_caps_malloc(total, MALLOC_CAP_SPIRAM));
+    if (blob == nullptr) {
+        return false;
+    }
+    memcpy(blob, kNvsMagic, sizeof(kNvsMagic));
+    blob[4] = static_cast<uint8_t>(override_w_ & 0xFF);
+    blob[5] = static_cast<uint8_t>((override_w_ >> 8) & 0xFF);
+    blob[6] = static_cast<uint8_t>(override_h_ & 0xFF);
+    blob[7] = static_cast<uint8_t>((override_h_ >> 8) & 0xFF);
+    blob[8] = static_cast<uint8_t>(bits & 0xFF);
+    blob[9] = static_cast<uint8_t>((bits >> 8) & 0xFF);
+    blob[10] = static_cast<uint8_t>((bits >> 16) & 0xFF);
+    blob[11] = static_cast<uint8_t>((bits >> 24) & 0xFF);
+    memcpy(blob + kNvsHeader, override_bits_, bits);
+
+    nvs_handle_t h = 0;
+    esp_err_t err = nvs_open(kNvsNamespace, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        err = nvs_set_blob(h, kNvsKey, blob, total);
+        if (err == ESP_OK) {
+            err = nvs_commit(h);
+        }
+        nvs_close(h);
+    }
+    heap_caps_free(blob);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "写 NVS 失败: %s", esp_err_to_name(err));
+        return false;
+    }
+    override_saved_ = true;
+    return true;
+}
+
+// 需已持锁
+bool HomePhoto::LoadSavedOverrideLocked() {
+    nvs_handle_t h = 0;
+    if (nvs_open(kNvsNamespace, NVS_READONLY, &h) != ESP_OK) {
+        return false;   // 从没存过，正常
+    }
+
+    size_t len = 0;
+    esp_err_t err = nvs_get_blob(h, kNvsKey, nullptr, &len);
+    if (err != ESP_OK || len <= kNvsHeader) {
+        nvs_close(h);
+        return false;
+    }
+
+    auto* blob = static_cast<uint8_t*>(heap_caps_malloc(len, MALLOC_CAP_SPIRAM));
+    if (blob == nullptr) {
+        nvs_close(h);
+        return false;
+    }
+    err = nvs_get_blob(h, kNvsKey, blob, &len);
+    nvs_close(h);
+    if (err != ESP_OK) {
+        heap_caps_free(blob);
+        return false;
+    }
+
+    if (memcmp(blob, kNvsMagic, sizeof(kNvsMagic)) != 0) {
+        heap_caps_free(blob);
+        return false;
+    }
+    const int w = blob[4] | (blob[5] << 8);
+    const int hh = blob[6] | (blob[7] << 8);
+    const size_t bits = static_cast<size_t>(blob[8]) |
+                        (static_cast<size_t>(blob[9]) << 8) |
+                        (static_cast<size_t>(blob[10]) << 16) |
+                        (static_cast<size_t>(blob[11]) << 24);
+
+    if (w <= 0 || hh <= 0 || w > 1024 || hh > 1024) {
+        heap_caps_free(blob);
+        return false;
+    }
+    const size_t stride = (static_cast<size_t>(w) + 7) / 8;
+    if (bits != stride * static_cast<size_t>(hh) || kNvsHeader + bits > len) {
+        ESP_LOGW(TAG, "NVS 里的壁纸数据不完整（%ux%u, %u 字节），忽略",
+                 static_cast<unsigned>(w), static_cast<unsigned>(hh),
+                 static_cast<unsigned>(bits));
+        heap_caps_free(blob);
+        return false;
+    }
+
+    if (override_bits_ != nullptr) {
+        heap_caps_free(override_bits_);
+        override_bits_ = nullptr;
+    }
+    override_bits_ = static_cast<uint8_t*>(heap_caps_malloc(bits, MALLOC_CAP_SPIRAM));
+    if (override_bits_ == nullptr) {
+        heap_caps_free(blob);
+        return false;
+    }
+    memcpy(override_bits_, blob + kNvsHeader, bits);
+    override_bytes_ = bits;
+    override_w_ = w;
+    override_h_ = hh;
+    override_active_ = true;
+    override_saved_ = true;
+    override_name_ = "上次上传";
+    heap_caps_free(blob);
+
+    ESP_LOGI(TAG, "已装回上次上传的壁纸（%dx%d，%u 字节，取自 NVS）",
+             w, hh, static_cast<unsigned>(bits));
+    return true;
+}
+
+bool HomePhoto::LoadSavedOverride() {
+    std::lock_guard<std::mutex> lk(mutex_);
+    return LoadSavedOverrideLocked();
+}
+
+bool HomePhoto::SaveOverride() {
+    std::lock_guard<std::mutex> lk(mutex_);
+    return SaveOverrideLocked();
+}
+
+bool HomePhoto::HasSavedOverride() const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    return override_saved_;
+}
+
+bool HomePhoto::ForgetSavedOverride() {
+    std::lock_guard<std::mutex> lk(mutex_);
+
+    override_active_ = false;
+    override_saved_ = false;
+
+    nvs_handle_t h = 0;
+    if (nvs_open(kNvsNamespace, NVS_READWRITE, &h) != ESP_OK) {
+        return true;   // 没有命名空间 = 本来就没存过
+    }
+    const esp_err_t err = nvs_erase_key(h, kNvsKey);
+    nvs_commit(h);
+    nvs_close(h);
+
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "清除 NVS 壁纸失败: %s", esp_err_to_name(err));
+        return false;
+    }
+    ESP_LOGI(TAG, "已清除常驻壁纸，主页回到内置默认图 / SD 卡照片");
+    return true;
 }

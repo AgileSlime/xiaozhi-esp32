@@ -24,3 +24,10 @@ secret_config.h
 
 # 串口抓取的日志
 logs/
+
+# 控制台构建产物
+tools/xiaozhi-console/target/
+
+# 网易云登录凭证（MUSIC_U 等于账号登录态，绝不入库）
+tools/xiaozhi-console/cookie.txt
+tools/netease-relay/cookie.txt

@@ -10,6 +10,7 @@
 #include <freertos/task.h>
 #include <esp_network.h>
 #include <esp_log.h>
+#include <esp_wifi.h>
 #include <utility>
 
 #include <font_awesome.h>
@@ -56,6 +57,12 @@ void WifiBoard::StartNetwork() {
     WifiManagerConfig config;
     config.ssid_prefix = "Xiaozhi";
     config.language = Lang::CODE;
+    // 重扫间隔上限 300 秒 → 60 秒。
+    // 用手机热点的人经常关掉/重启热点，板子断开后会按 10 秒、20 秒、40 秒…退避重扫，
+    // 默认上限 5 分钟意味着"热点早回来了板子还在睡"——屏幕上就是一直显示未连接。
+    // 压到 1 分钟，热点一恢复板子最迟 1 分钟内自己连回来，不用人去按复位。
+    config.station_scan_min_interval_seconds = 10;
+    config.station_scan_max_interval_seconds = 60;
     wifi_manager.Initialize(config);
 
     // Set unified event callback - forward to NetworkEvent with SSID data
@@ -115,6 +122,22 @@ void WifiBoard::OnNetworkEvent(NetworkEvent event, const std::string& data) {
 #endif
             in_config_mode_ = false;
             ESP_LOGI(TAG, "Connected to WiFi: %s", data.c_str());
+            // 降 WiFi 发射功率 20dBm → 15dBm（单位 0.25dBm，60 = 15dBm）。
+            // 原因：ESP32-S3 满功率发射峰值电流可达 350mA+，电池/DCDC 供电时
+            // 3.3V 会被拉低，而本板 PSRAM 跑 Octal 80MHz，对电压极敏感——
+            // 电压一跌 PSRAM 读写就出错，表现就是"插 USB 能传图、拔了 USB 报
+            // 解码失败（422）"，以及音乐偶发爆音。
+            // 15dBm 对室内连接完全够用（本机 RSSI 常年在 -30 左右），
+            // 峰值电流能降一大截，换来 PSRAM 稳定。
+            {
+                const int8_t kTxPowerQuarterDbm = 60;   // 15 dBm
+                esp_err_t perr = esp_wifi_set_max_tx_power(kTxPowerQuarterDbm);
+                if (perr != ESP_OK) {
+                    ESP_LOGW(TAG, "设置 WiFi 发射功率失败: %s", esp_err_to_name(perr));
+                } else {
+                    ESP_LOGI(TAG, "WiFi 发射功率已限制为 15dBm（降低峰值电流，保 PSRAM 稳定）");
+                }
+            }
             break;
         case NetworkEvent::Scanning:
             ESP_LOGI(TAG, "WiFi scanning");
@@ -286,7 +309,11 @@ void WifiBoard::SetPowerSaveLevel(PowerSaveLevel level) {
     WifiPowerSaveLevel wifi_level;
     switch (level) {
         case PowerSaveLevel::LOW_POWER:
-            wifi_level = WifiPowerSaveLevel::LOW_POWER;
+            // 说明：MAX_MODEM 省电下射频每秒才醒一次（listen interval 1.02s），
+            // 电脑控制台发 HTTP 命令/上传图片时，第一个请求要白等 1~3 秒，
+            // 弱网（2.4G + 信号一般）下直接超时——这就是"网页/命令时灵时不灵"的根因。
+            // 这里把"空闲省电"降级到 MIN_MODEM：响应快一个数量级，省电略降但可接受。
+            wifi_level = WifiPowerSaveLevel::BALANCED;   // MIN_MODEM
             break;
         case PowerSaveLevel::BALANCED:
             wifi_level = WifiPowerSaveLevel::BALANCED;

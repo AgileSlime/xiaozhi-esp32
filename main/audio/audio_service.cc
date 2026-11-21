@@ -792,6 +792,15 @@ void AudioService::SetExternalPlaybackActive(bool active) {
         if (!codec_->output_enabled()) {
             codec_->EnableOutput(true);
         }
+        // 关键：麦克风也必须在这里打开。
+        // 空闲待机时省电逻辑会把输入关掉；如果只开输出，
+        // 放歌期间 AFE 根本收不到音频 → 唤醒词失效。
+        // 现象就是：喊「你好小智」毫无反应，只有按键强制才能进对话
+        // （按键那条路径自己会 EnableInput(true)，所以显得"按键有用"）。
+        if (!codec_->input_enabled()) {
+            codec_->EnableInput(true);
+            ESP_LOGI(TAG, "外部播放：重新打开麦克风输入（保证唤醒词可用）");
+        }
         esp_timer_stop(audio_power_timer_);
         esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
     }
@@ -803,10 +812,15 @@ void AudioService::CheckAndUpdateAudioPowerState() {
     auto output_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_output_time_).count();
 
     if (external_playback_active_) {
-        // 外部播放期间允许关闭输入省电，但保持输出开启，防止播放中断/抖动。
-        if (input_elapsed > AUDIO_POWER_TIMEOUT_MS && codec_->input_enabled()) {
-            codec_->EnableInput(false);
-        }
+        // 外部播放（HTTP 音乐直链 / SD 卡音乐）期间，输入输出**都保持常开**。
+        //
+        //  · 关输出 → 播放中断、每秒卡一下
+        //    （参考上游修复 88115fa：输出通道反复开关是白噪音/音乐卡顿的主因）
+        //  · 关输入 → 麦克风失效，放歌时喊「你好小智」完全没反应
+        //    （原来这里允许关输入省电，实测就是"放歌后唤不醒"的元凶）
+        //
+        // 放音乐本身已经是高功耗场景，省这点待机电流不值得牺牲唤醒能力。
+        // 真正该省电的是"完全空闲"那条分支（下面）。
         return;
     }
 

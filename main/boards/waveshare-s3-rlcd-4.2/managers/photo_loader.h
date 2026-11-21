@@ -45,9 +45,20 @@ public:
 
     // ===== 一次性图片（不落 SD，上传即生效）=====
     // 网页上传走这条通道：JPEG 在内存里解码 + 抖动 → 存成 1bpp 位图（210×248 只要 6510 字节）
-    // → 立刻铺到主页。不写 SD 卡，所以不依赖读卡器、也不会越传越多；
-    // 代价是重启后回到内置默认壁纸（或者 SD 卡里原有的图）。
+    // → 立刻铺到主页。不写 SD 卡，所以不依赖读卡器、也不会越传越多。
     bool ApplyJpegMemory(const uint8_t* jpg, size_t len, int width, int height);
+
+    // ===== 常驻（重启后还是这张）=====
+    // 6510 字节的 1bpp 位图直接写进 NVS，掉电不丢。于是"上传的图"就变成了新的默认图：
+    // 关机、重启、拔电，主页都是它，直到再传一张或者显式恢复内置图。
+    //
+    // 注意：NVS 写 Flash 期间 cache 是关的，这个方法**必须在内部 RAM 的栈上调用**
+    // （httpd 任务、串口任务、主任务都满足；自己建的 PSRAM 栈任务不行，会 assert 重启）。
+    bool SaveOverride();          // 通常不用手动调，ApplyJpegMemory 成功后自动存
+    bool LoadSavedOverride();     // 开机调用一次，把上次那张装回 override 槽
+    bool HasSavedOverride() const;
+    bool ForgetSavedOverride();   // 彻底改回内置默认图（连 NVS 里那份一起删）
+
     void ClearOverride();
     bool HasOverride() const;
     // 当前这次的图片是谁（网页列表里显示用）
@@ -56,6 +67,9 @@ public:
     // 当前显示的是第几张、叫什么
     int CurrentIndex() const { return current_index_; }
     const std::string& CurrentName() const { return current_name_; }
+    // 当前 override 位图的尺寸（串口 photo 命令显示用）
+    int CurrentSizeW() const { return override_w_; }
+    int CurrentSizeH() const { return override_h_; }
 
     // 重新扫描目录（网页上传/删除图片后调用，让新文件立刻可见）
     void Rescan();
@@ -104,13 +118,18 @@ private:
     bool dsc_ready_ = false;
 
     // 一次性图片：抖动后的 1bpp 位图（每行 (w+7)/8 字节，MSB 在前，1=白）
-    // 210×248 = 6510 字节，比存 JPEG 还省，重启即失（不写 Flash）
+    // 210×248 = 6510 字节，比存 JPEG 还省
     uint8_t* override_bits_ = nullptr;
     size_t override_bytes_ = 0;
     int override_w_ = 0;
     int override_h_ = 0;
     bool override_active_ = false;
+    bool override_saved_ = false;       // NVS 里存着一份（重启后会自动装回来）
     std::string override_name_ = "网页上传";
+
+    // NVS 读写实现：Save/Load 持锁后调这两个，避免递归加锁
+    bool SaveOverrideLocked();
+    bool LoadSavedOverrideLocked();
 };
 
 #endif

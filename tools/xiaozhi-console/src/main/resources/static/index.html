@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>小智桌面控制台</title>
+  <link rel="stylesheet" href="https://unpkg.com/element-plus@2.7.6/dist/index.css">
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; background: #f5f7fa; }
+    #app { min-height: 100vh; }
+    .page-header { background: linear-gradient(135deg, #409eff 0%, #1f6fb2 100%); color: #fff; padding: 18px 24px; box-shadow: 0 2px 8px rgba(0,0,0,.08); }
+    .page-header h1 { margin: 0; font-size: 22px; font-weight: 600; letter-spacing: .5px; }
+    .page-header .sub { margin-top: 4px; font-size: 13px; opacity: .9; }
+    .status-bar { display: flex; gap: 18px; flex-wrap: wrap; padding: 12px 24px; background: #fff; border-bottom: 1px solid #ebeef5; font-size: 13px; }
+    .status-bar .item { display: inline-flex; align-items: center; gap: 6px; color: #606266; }
+    .status-bar .item b { color: #303133; font-weight: 600; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+    .dot.on { background: #67c23a; box-shadow: 0 0 0 3px rgba(103,194,58,.18); }
+    .dot.off { background: #c0c4cc; }
+    .container { padding: 18px 24px; }
+    .grid { display: grid; grid-template-columns: 1.1fr 1.1fr 1fr; gap: 16px; }
+    @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
+    .card { background: #fff; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,.04); border: 1px solid #ebeef5; margin-bottom: 16px; overflow: hidden; }
+    .card .head { padding: 14px 18px; border-bottom: 1px solid #f0f2f5; font-weight: 600; font-size: 15px; color: #303133; display: flex; justify-content: space-between; align-items: center; }
+    .card .body { padding: 16px 18px; }
+    .log-stream { background: #1e1e1e; color: #d4d4d4; font-family: "JetBrains Mono", Consolas, "Cascadia Code", monospace; font-size: 12.5px; line-height: 1.55; padding: 12px 14px; height: 360px; overflow-y: auto; border-radius: 6px; }
+    .log-stream .lv-info { color: #9cdcfe; }
+    .log-stream .lv-ok { color: #6ec07a; }
+    .log-stream .lv-warn { color: #d7ba7d; }
+    .log-stream .lv-error { color: #f48771; }
+    .log-stream .ts { color: #7a7a7a; margin-right: 6px; }
+    .photo-preview { width: 100%; aspect-ratio: 420 / 496; background: #000; border-radius: 6px; display: flex; align-items: center; justify-content: center; color: #909399; font-size: 13px; overflow: hidden; }
+    .photo-preview img { width: 100%; height: 100%; object-fit: contain; }
+    .drop-zone { border: 2px dashed #c0c4cc; border-radius: 6px; padding: 18px; text-align: center; color: #909399; cursor: pointer; transition: border-color .2s, color .2s; }
+    .drop-zone:hover, .drop-zone.dragover { border-color: #409eff; color: #409eff; }
+    .quick-cmd { display: flex; flex-wrap: wrap; gap: 8px; }
+    .song-item { padding: 8px 10px; border-radius: 4px; cursor: pointer; transition: background .15s; }
+    .song-item:hover { background: #f5f7fa; }
+    .song-item .title { font-size: 14px; color: #303133; }
+    .song-item .meta { font-size: 12px; color: #909399; margin-top: 2px; }
+    .muted { color: #909399; font-size: 12px; }
+  </style>
+</head>
+<body>
+<div id="app">
+  <div class="page-header">
+    <h1>小智桌面控制台</h1>
+    <div class="sub">网易云中转 · 板子控制 · 壁纸上传，一个服务全搞定</div>
+  </div>
+
+  <div class="status-bar">
+    <div class="item">
+      <span class="dot" :class="state.online ? 'on' : 'off'"></span>
+      <span v-if="state.online">板子在线：<b>{{ state.deviceIp || '…' }}</b></span>
+      <span v-else>板子未发现</span>
+    </div>
+    <div class="item" v-if="state.deviceWebUrl">
+      图片网页：<b><a :href="state.deviceWebUrl" target="_blank">{{ state.deviceWebUrl }}</a></b>
+    </div>
+    <div class="item">本机：<b>{{ (state.localIps || []).join(', ') || '…' }}</b></div>
+    <div class="item">网易云 Cookie：<b>{{ state.hasCookie ? '已配置' : '未配置' }}</b></div>
+    <div class="item"><el-button size="small" @click="refreshState">刷新</el-button></div>
+  </div>
+
+  <div class="container">
+    <div class="grid">
+      <!-- 左列：壁纸上传 -->
+      <div>
+        <div class="card">
+          <div class="head"><span>换壁纸（常驻，重启不丢）</span></div>
+          <div class="body">
+            <div class="photo-preview" v-if="previewUrl">
+              <img :src="previewUrl" alt="预览">
+            </div>
+            <div class="drop-zone"
+                 :class="{ dragover: dragover }"
+                 @click="$refs.file.click()"
+                 @dragover.prevent="dragover = true"
+                 @dragleave.prevent="dragover = false"
+                 @drop.prevent="onDrop">
+              点击选择图片，或把图片拖进来<br>
+              <span class="muted">会自动缩到屏幕原生 210×248，传完立刻上屏并写入板子 NVS</span>
+            </div>
+            <input type="file" ref="file" accept="image/*" style="display:none" @change="onPick">
+            <div style="margin-top:12px; display:flex; gap:8px;">
+              <el-button type="primary" :loading="uploading" :disabled="!pickedFile" @click="doUpload">
+                {{ uploading ? '上传中…' : '上传到板子' }}
+              </el-button>
+              <el-button :loading="resetting" @click="doReset">恢复内置壁纸</el-button>
+            </div>
+            <div class="muted" style="margin-top:10px">上传后板子会存进 NVS，关电源再开机仍是这张图；「恢复内置壁纸」会同时清掉 NVS 里的缓存。</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="head"><span>播放器头像（唱片中心 52×52）</span></div>
+          <div style="display:flex;gap:14px;align-items:flex-start">
+            <div style="width:104px;height:104px;border:1px dashed #d0d0d5;border-radius:10px;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#fafafa">
+              <img v-if="avatarPreview" :src="avatarPreview" style="width:100%;height:100%;object-fit:cover">
+              <span v-else class="muted" style="font-size:12px">无预览</span>
+            </div>
+            <div style="flex:1">
+              <el-upload :show-file-list="false" :auto-upload="false" accept="image/*"
+                         @change="onPickAvatar" style="display:inline-block">
+                <el-button>选择图片</el-button>
+              </el-upload>
+              <el-button type="primary" :loading="avatarUploading" :disabled="!avatarFile"
+                         @click="doUploadAvatar" style="margin-left:8px">
+                {{ avatarUploading ? '上传中…' : '上传头像' }}
+              </el-button>
+              <div class="muted" style="margin-top:10px">
+                建议方形图片，会自动裁成 52×52 黑白点阵存进 NVS，重启不丢；进播放器页就能看到。
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="head"><span>网易云登录（扫码）</span></div>
+          <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+            <span :style="{fontSize:'14px',color: neteaseLoggedIn ? '#34c759' : '#ff9500'}">
+              {{ neteaseLoggedIn ? '✓ 已登录' : '未登录（只能放免费曲库，搜到的多是翻唱）' }}
+            </span>
+            <el-button size="small" :loading="qrLoading" @click="startQrLogin">
+              {{ qrContent ? '刷新二维码' : '生成二维码' }}
+            </el-button>
+          </div>
+          <div v-if="qrContent" style="margin-top:14px;display:flex;gap:16px;align-items:flex-start">
+            <div id="qrcode-box" style="padding:8px;background:#fff;border:1px solid #eee;border-radius:8px;flex:none"></div>
+            <div style="font-size:13px;color:#666;line-height:1.8;min-width:0">
+              <div style="font-weight:600;color:#1d1d1f">{{ qrStatus }}</div>
+              <div style="margin-top:6px">用手机网易云 App 扫码 → 确认登录。</div>
+              <div>成功后自动保存 cookie，<b>不用重启控制台</b>。</div>
+              <div style="margin-top:8px;font-size:12px;color:#999">
+                二维码没出来？把下面这行发到手机浏览器打开：
+              </div>
+              <a :href="qrContent" target="_blank"
+                 style="font-size:12px;word-break:break-all;color:#0071e3">{{ qrContent }}</a>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="head"><span>快捷命令</span></div>
+          <div class="body">
+            <div class="quick-cmd">
+              <el-button size="small" @click="sendCmd('page home')">主页</el-button>
+              <el-button size="small" @click="sendCmd('page weather')">天气</el-button>
+              <el-button size="small" @click="sendCmd('page memo')">备忘</el-button>
+              <el-button size="small" @click="sendCmd('page music')">音乐</el-button>
+              <el-button size="small" @click="sendCmd('status')">看状态</el-button>
+              <el-button size="small" type="danger" @click="sendCmd('reboot')">重启板子</el-button>
+            </div>
+            <div style="margin-top:16px;">
+              <div style="display:flex; align-items:center; gap:12px; margin-bottom:4px;">
+                <span style="font-size:13px; color:#606266;">音量</span>
+                <el-slider v-model="volume" :min="0" :max="100" style="flex:1;" @change="setVolume"></el-slider>
+                <span style="font-size:13px; color:#303133; font-weight:600; min-width:34px; text-align:right;">{{ volume }}</span>
+              </div>
+              <div class="muted">拖动滑块调节板子音量（0-100），松手即下发。</div>
+            </div>
+            <div style="margin-top:12px; display:flex; gap:8px;">
+              <el-input v-model="cmdText" placeholder="自定义命令，如 page music" size="small" @keyup.enter="sendCmd(cmdText)"></el-input>
+              <el-button size="small" type="primary" @click="sendCmd(cmdText)">执行</el-button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 中列：点歌 -->
+      <div>
+        <div class="card">
+          <div class="head"><span>点歌</span></div>
+          <div class="body">
+            <div style="display:flex; gap:8px;">
+              <el-input v-model="songKw" placeholder="歌名 / 歌手 歌名" @keyup.enter="doPlay(songKw)"></el-input>
+              <el-button type="primary" :loading="playing" @click="doPlay(songKw)">点歌</el-button>
+            </div>
+            <div style="margin-top:10px; display:flex; gap:8px;">
+              <el-button size="small" @click="sendCmd('pause')">暂停</el-button>
+              <el-button size="small" @click="sendCmd('resume')">继续</el-button>
+              <el-button size="small" type="danger" @click="sendCmd('stop')">停止</el-button>
+            </div>
+            <div class="muted" style="margin-top:8px">板子会自己去找中转拿直链，这里只负责把命令下发。</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="head">
+            <span>搜索（预览直链）</span>
+            <el-button size="small" text type="primary" @click="doSearch">搜索</el-button>
+          </div>
+          <div class="body" style="max-height:340px; overflow-y:auto;">
+            <div v-if="songs.length === 0" class="muted">输入歌名后点「搜索」，这里列出候选，点一下试听直链。</div>
+            <div v-for="s in songs" :key="s.id" class="song-item" @click="previewSong(s)">
+              <div class="title">{{ s.title }}</div>
+              <div class="meta">{{ s.artist }} · {{ s.album }} · {{ fmtMs(s.duration_ms) }}</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 右列：日志 -->
+      <div>
+        <div class="card">
+          <div class="head"><span>实时日志</span></div>
+          <div class="body" style="padding: 12px;">
+            <div class="log-stream" ref="logBox">
+              <div v-for="(l, i) in logs" :key="i">
+                <span class="ts">{{ l.time }}</span>
+                <span :class="'lv-' + l.level">{{ l.message }}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/vue@3.4.31/dist/vue.global.prod.js"></script>
+<script src="https://unpkg.com/element-plus@2.7.6/dist/index.full.min.js"></script>
+<script src="https://unpkg.com/qrcodejs@1.0.0/qrcode.min.js"></script>
+<script>
+const { createApp, ref, onMounted, nextTick } = Vue;
+
+createApp({
+  setup() {
+    const state = ref({ online: false, deviceIp: '', deviceWebUrl: '', localIps: [], hasCookie: false });
+    const logs = ref([]);
+    const previewUrl = ref('');
+    const pickedFile = ref(null);
+    const uploading = ref(false);
+    const resetting = ref(false);
+    const dragover = ref(false);
+    const songKw = ref('');
+    const playing = ref(false);
+    const songs = ref([]);
+    const cmdText = ref('');
+    const logBox = ref(null);
+    const volume = ref(50);
+
+    function fmtMs(ms) {
+      if (!ms) return '';
+      const s = Math.round(ms / 1000);
+      const m = Math.floor(s / 60), ss = s % 60;
+      return m + ':' + String(ss).padStart(2, '0');
+    }
+
+    async function refreshState() {
+      try {
+        const r = await fetch('/api/state');
+        state.value = await r.json();
+      } catch (e) { /* 忽略 */ }
+    }
+
+    function scrollLog() {
+      nextTick(() => {
+        if (logBox.value) logBox.value.scrollTop = logBox.value.scrollHeight;
+      });
+    }
+
+    function connectLogs() {
+      const es = new EventSource('/api/logs');
+      es.addEventListener('log', (e) => {
+        try {
+          logs.value.push(JSON.parse(e.data));
+          if (logs.value.length > 300) logs.value.splice(0, logs.value.length - 300);
+          scrollLog();
+        } catch (_) {}
+      });
+      es.onerror = () => { /* SSE 会自动重连 */ };
+    }
+
+    function onPick(e) {
+      const f = e.target.files[0];
+      if (f) setFile(f);
+    }
+    function onDrop(e) {
+      dragover.value = false;
+      const f = e.dataTransfer.files[0];
+      if (f) setFile(f);
+    }
+    function setFile(f) {
+      pickedFile.value = f;
+      if (previewUrl.value) URL.revokeObjectURL(previewUrl.value);
+      previewUrl.value = URL.createObjectURL(f);
+    }
+
+    async function doUpload() {
+      if (!pickedFile.value) return;
+      uploading.value = true;
+      // 板子解码偶发失败（PSRAM 时序抖动）时自动重试，省得用户狂点。
+      // 正常一次就过；真失败也会在 3 次后如实报错。
+      const maxTry = 3;
+      let lastErr = '上传失败';
+      try {
+        for (let attempt = 1; attempt <= maxTry; attempt++) {
+          try {
+            const fd = new FormData();
+            fd.append('file', pickedFile.value);
+            const r = await fetch('/api/upload', { method: 'POST', body: fd });
+            const o = await r.json();
+            if (o.ok) {
+              ElMessage.success(attempt > 1
+                ? '壁纸已上传（第 ' + attempt + ' 次成功）'
+                : '壁纸已上传并写入 NVS');
+              return;
+            }
+            lastErr = o.error || '上传失败';
+          } catch (e) {
+            lastErr = '上传失败：' + e.message;
+          }
+          if (attempt < maxTry) {
+            await new Promise(res => setTimeout(res, 700));
+          }
+        }
+        ElMessage.error(lastErr + '（已自动重试 ' + maxTry + ' 次）');
+      } finally {
+        uploading.value = false;
+      }
+    }
+
+    // ===== 播放器头像上传 =====
+    const avatarFile = ref(null);
+    const avatarUploading = ref(false);
+    const avatarPreview = ref('');
+
+    function onPickAvatar(uploadFile) {
+      avatarFile.value = uploadFile.raw;
+      if (avatarPreview.value) URL.revokeObjectURL(avatarPreview.value);
+      avatarPreview.value = URL.createObjectURL(uploadFile.raw);
+    }
+
+    async function doUploadAvatar() {
+      if (!avatarFile.value) return;
+      avatarUploading.value = true;
+      try {
+        const fd = new FormData();
+        fd.append('file', avatarFile.value);
+        const r = await fetch('/api/upload-avatar', { method: 'POST', body: fd });
+        const o = await r.json();
+        if (o.ok) ElMessage.success('头像已更新，进播放器页看看');
+        else ElMessage.error(o.error || '上传失败');
+      } catch (e) {
+        ElMessage.error('上传失败：' + e.message);
+      } finally {
+        avatarUploading.value = false;
+      }
+    }
+
+    // ===== 网易云扫码登录 =====
+    const neteaseLoggedIn = ref(false);
+    const qrLoading = ref(false);
+    const qrContent = ref('');
+    const qrStatus = ref('');
+    let qrTimer = null;
+    let qrKey = '';
+    // 代次：每次生成新二维码 +1，旧轮询发现代次对不上就直接退出。
+    // 不这么做的话，快速点两次「刷新」会有两个轮询同时跑，
+    // 旧 key 的无效请求会触发网易云风控（8821），把新 key 的登录也搅黄。
+    let qrGen = 0;
+
+    async function refreshNeteaseStatus() {
+      try {
+        const r = await fetch('/api/netease/status');
+        const o = await r.json();
+        neteaseLoggedIn.value = !!o.loggedIn;
+      } catch (e) { /* 忽略 */ }
+    }
+
+    async function startQrLogin() {
+      qrLoading.value = true;
+      qrStatus.value = '';
+      try {
+        const r = await fetch('/api/netease/qr/new');
+        const o = await r.json();
+        if (!o.ok) { ElMessage.error(o.error || '生成二维码失败'); return; }
+        qrKey = o.key;
+        qrContent.value = o.qrContent;
+        await nextTick();
+        const box = document.getElementById('qrcode-box');
+        if (box) {
+          box.innerHTML = '';
+          try {
+            if (typeof QRCode === 'undefined') {
+              throw new Error('二维码库没加载出来（网络问题）');
+            }
+            new QRCode(box, { text: o.qrContent, width: 168, height: 168, correctLevel: QRCode.CorrectLevel.M });
+          } catch (e) {
+            // 库挂了不影响主流程：下面已经显示了可点击的登录链接
+            box.innerHTML = '<div style="width:168px;height:168px;display:flex;align-items:center;justify-content:center;text-align:center;font-size:12px;color:#999">二维码渲染失败<br>用右侧链接登录</div>';
+            console.warn('二维码渲染失败', e);
+          }
+        }
+        qrStatus.value = '等待扫码…';
+        if (qrTimer) clearInterval(qrTimer);
+        const myGen = ++qrGen;
+        qrTimer = setInterval(function(){ pollQr(myGen); }, 2500);
+      } catch (e) {
+        ElMessage.error('生成二维码失败：' + e.message);
+      } finally {
+        qrLoading.value = false;
+      }
+    }
+
+    async function pollQr(myGen) {
+      // 代次对不上 = 这是个过期的轮询，直接退出，一个请求都别再发
+      if (myGen !== qrGen) return;
+      if (!qrKey) return;
+      try {
+        const r = await fetch('/api/netease/qr/check?key=' + encodeURIComponent(qrKey));
+        const o = await r.json();
+
+        // 8821 = 网易云风控（环境异常）。这个 key 已经废了，
+        // 继续轮询只会不断触发风控、甚至干扰另一个有效的轮询，
+        // 所以立刻停掉，让用户刷新二维码。
+        if (o.code === 8821) {
+          clearInterval(qrTimer); qrTimer = null;
+          qrStatus.value = '登录环境异常（网易云风控），请点「刷新二维码」重试';
+          return;
+        }
+
+        if (o.message) qrStatus.value = o.message;
+        if (o.code === 803 && o.ok) {
+          clearInterval(qrTimer); qrTimer = null;
+          neteaseLoggedIn.value = true;
+          qrContent.value = '';
+          ElMessage.success('登录成功，cookie 已保存（' + (o.cookieLen || 0) + ' 字符）');
+        } else if (o.code === 800) {
+          clearInterval(qrTimer); qrTimer = null;
+          qrStatus.value = '二维码已过期，点「刷新二维码」重来';
+        }
+      } catch (e) { /* 网络抖动，下一轮继续 */ }
+    }
+
+    async function doReset() {
+      resetting.value = true;
+      try {
+        const r = await fetch('/api/reset', { method: 'POST' });
+        const o = await r.json();
+        if (!o.ok) ElMessage.error(o.error || '恢复失败');
+        else ElMessage.success('已恢复内置壁纸');
+      } catch (e) {
+        ElMessage.error('恢复失败：' + e.message);
+      } finally {
+        resetting.value = false;
+      }
+    }
+
+    async function sendCmd(c) {
+      if (!c || !c.trim()) return;
+      try {
+        const r = await fetch('/api/cmd?c=' + encodeURIComponent(c.trim()), { method: 'POST' });
+        const o = await r.json();
+        if (o.ok && o.output) ElMessage.info('返回：' + o.output);
+        else if (!o.ok) ElMessage.error(o.error || '命令失败');
+        cmdText.value = '';
+      } catch (e) {
+        ElMessage.error('命令失败：' + e.message);
+      }
+    }
+
+    async function doPlay(kw) {
+      if (!kw || !kw.trim()) return;
+      playing.value = true;
+      try {
+        const r = await fetch('/api/play?kw=' + encodeURIComponent(kw.trim()), { method: 'POST' });
+        const o = await r.json();
+        if (o.ok) ElMessage.success('已点歌：' + kw.trim());
+        else ElMessage.error(o.error || '点歌失败');
+      } catch (e) {
+        ElMessage.error('点歌失败：' + e.message);
+      } finally {
+        playing.value = false;
+      }
+    }
+
+    async function doSearch() {
+      if (!songKw.value.trim()) return;
+      try {
+        const r = await fetch('/api/music/search?kw=' + encodeURIComponent(songKw.value.trim()));
+        const o = await r.json();
+        if (o.ok) songs.value = o.songs || [];
+        else ElMessage.error(o.error || '搜索失败');
+      } catch (e) {
+        ElMessage.error('搜索失败：' + e.message);
+      }
+    }
+
+    async function setVolume(v) {
+      try {
+        const r = await fetch('/api/cmd?c=' + encodeURIComponent('volume ' + v), { method: 'POST' });
+        const o = await r.json();
+        if (o.ok) ElMessage.success('音量已设为 ' + v);
+        else ElMessage.error(o.error || '设置音量失败');
+      } catch (e) {
+        ElMessage.error('设置音量失败：' + e.message);
+      }
+    }
+
+    function previewSong(s) {
+      const kw = s.title + ' ' + s.artist;
+      fetch('/api/music/play?kw=' + encodeURIComponent(kw))
+        .then(r => r.json())
+        .then(o => {
+          if (o.ok && o.url) {
+            window.open(o.url, '_blank');
+            ElMessage.success('已打开直链：' + o.title);
+          } else {
+            ElMessage.warning(o.reason || '拿不到直链');
+          }
+        })
+        .catch(e => ElMessage.error('取直链失败：' + e.message));
+    }
+
+    onMounted(() => {
+      refreshState();
+      refreshNeteaseStatus();
+      connectLogs();
+      setInterval(refreshState, 15000);
+    });
+
+    return {
+      state, logs, previewUrl, pickedFile, uploading, resetting, dragover,
+      songKw, playing, songs, cmdText, logBox, volume,
+      avatarFile, avatarUploading, avatarPreview,
+      neteaseLoggedIn, qrLoading, qrContent, qrStatus,
+      fmtMs, refreshState, onPick, onDrop, doUpload, doReset,
+      onPickAvatar, doUploadAvatar, startQrLogin, refreshNeteaseStatus,
+      sendCmd, doPlay, doSearch, previewSong, setVolume
+    };
+  }
+}).use(ElementPlus).mount('#app');
+</script>
+</body>
+</html>

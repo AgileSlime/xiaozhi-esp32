@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <utility>
 #include <esp_log.h>
 #include <cJSON.h>
 #include <driver/gpio.h>
@@ -35,8 +36,11 @@ struct MusicPlaybackTaskArgs {
     std::string url;
     std::string title;
     std::string artist;
-    std::string lyric_url;
-    uint32_t start_ms = 0;   // 从该位置开始播放（快进用），0 = 从头
+    std::string lyric_url;      // 歌词 URL（为空则用 lyric_text）
+    std::string lyric_text;     // 直接给的 LRC 歌词文本（为空则用 lyric_url 拉取）
+    std::string cover;          // 专辑封面图 URL（可为空）
+    uint32_t start_ms = 0;      // 从该位置开始播放（快进用），0 = 从头
+    uint32_t duration_ms = 0;   // 中转给的歌曲总时长（进度条用），0 = 未知
 };
 
 // ===== 本地音频时长探测 =====
@@ -1302,7 +1306,8 @@ void Application::PlaySound(const std::string_view& sound) {
 
 bool Application::PlayMusicFromUrl(const std::string& url, const std::string& title, const std::string& artist,
                                    const std::string& lyric, const std::string& lyric_url,
-                                   uint32_t start_ms, bool force) {
+                                   uint32_t start_ms, bool force, uint32_t duration_ms,
+                                   const std::string& cover) {
     if (url.empty()) {
         return false;
     }
@@ -1365,29 +1370,51 @@ bool Application::PlayMusicFromUrl(const std::string& url, const std::string& ti
         display->SetMusicLyric("");
         display->SetMusicPlayState(true, false);
     });
-    if (!lyric.empty()) {
-        UpdateMusicLyric(lyric);
-    }
+    // 歌词不再在这里直接上屏：原始 LRC 带时间戳，直接显示会把
+    // "[00:29.34]故事的小黄..." 这种原始行塞进歌词区。统一交给播放任务
+    // 解析成"按时间戳滚动"的结构后再显示。
 
     auto* args = new MusicPlaybackTaskArgs();
     args->app = this;
     args->url = url;
     args->title = display_title;
     args->artist = display_artist;
-    // 优先使用直接歌词文本；如果为空则把 lyric_url 传给播放任务，让它自行拉取
+    // 歌词两个来源二选一：直接文本优先，都没有就交给任务自己按 lyric_url 拉取
     args->lyric_url = lyric.empty() ? lyric_url : "";
+    args->lyric_text = lyric;
+    args->cover = cover;
     args->start_ms = start_ms;
+    args->duration_ms = duration_ms;
 
-    // 播放任务的栈（12KB）放 PSRAM：它只做"读流 → 解码 → 喂 I2S"，
-    // 不写 NVS、不进 Flash 操作，内部 RAM 留给 AFE 和语音链路。
+    // 播放任务的栈（12KB）放 PSRAM。
+    //
+    // 曾经挪到内部 RAM 想救音乐卡顿，结果内部 RAM 被挤到只剩 17KB
+    // （日志 minimal sram），AFE 语音前端拿不到连续内存，
+    // **放歌时就唤不醒 AI 了**——语音是核心功能，优先级高于那点卡顿。
+    // PSRAM 80MHz 下栈访问的额外延迟对整体影响很小（顺序访问，且有 cache），
+    // 真正影响音质的是 I2S DMA 缓冲深度，那个已经加厚了。
     BaseType_t created = xTaskCreateWithCaps([](void* arg) {
         std::unique_ptr<MusicPlaybackTaskArgs> task_args(static_cast<MusicPlaybackTaskArgs*>(arg));
         task_args->app->MusicPlaybackTask(std::move(task_args->url), std::move(task_args->title),
                                           std::move(task_args->artist), std::move(task_args->lyric_url),
-                                          task_args->start_ms);
-        // 与 xTaskCreateWithCaps 配对，否则 PSRAM 里的栈不会释放
+                                          std::move(task_args->lyric_text), task_args->start_ms,
+                                          task_args->duration_ms, std::move(task_args->cover));
+        // 与 xTaskCreateWithCaps 配对，否则栈不会释放
         vTaskDeleteWithCaps(nullptr);
     }, "music_playback", 12288, args, 3, &music_playback_task_handle_, MALLOC_CAP_SPIRAM);
+
+    if (created != pdPASS) {
+        // 内部 RAM 不够（AFE 占了大头）：退回 PSRAM，宁可慢也不能放不了歌
+        ESP_LOGW(TAG, "音乐播放任务内部 RAM 不足，回退到 PSRAM 栈");
+        created = xTaskCreateWithCaps([](void* arg) {
+            std::unique_ptr<MusicPlaybackTaskArgs> task_args(static_cast<MusicPlaybackTaskArgs*>(arg));
+            task_args->app->MusicPlaybackTask(std::move(task_args->url), std::move(task_args->title),
+                                              std::move(task_args->artist), std::move(task_args->lyric_url),
+                                              std::move(task_args->lyric_text), task_args->start_ms,
+                                              task_args->duration_ms, std::move(task_args->cover));
+            vTaskDeleteWithCaps(nullptr);
+        }, "music_playback", 12288, args, 3, &music_playback_task_handle_, MALLOC_CAP_SPIRAM);
+    }
 
     if (created != pdPASS) {
         delete args;
@@ -1402,7 +1429,9 @@ bool Application::PlayMusicFromUrl(const std::string& url, const std::string& ti
 }
 
 void Application::MusicPlaybackTask(std::string url, std::string title, std::string artist,
-                                    std::string lyric_url, uint32_t start_ms) {
+                                    std::string lyric_url, std::string lyric_text,
+                                    uint32_t start_ms, uint32_t duration_ms,
+                                    std::string cover) {
     auto& board = Board::GetInstance();
     auto display = board.GetDisplay();
     auto codec = board.GetAudioCodec();
@@ -1438,7 +1467,7 @@ void Application::MusicPlaybackTask(std::string url, std::string title, std::str
     uint32_t track_total_ms = 0;
 
     // 本地文件：未显式提供歌词时，自动找同目录同名 .lrc
-    if (is_local && lyric_url.empty()) {
+    if (is_local && lyric_url.empty() && lyric_text.empty()) {
         std::string guess = local_path;
         size_t dot = guess.find_last_of('.');
         if (dot != std::string::npos) {
@@ -1453,12 +1482,14 @@ void Application::MusicPlaybackTask(std::string url, std::string title, std::str
         }
     }
 
-    // 如果有歌词 URL（或本地 lrc 路径），拉取并解析 LRC 格式
-    if (!lyric_url.empty()) {
+    // 歌词两个来源：直接文本（中转给的原始 LRC）优先，否则按 lyric_url 拉取。
+    // 统一落到 local_lyric_text，再用同一个解析器解析，避免两条路径行为不一致。
+    std::string local_lyric_text;
+    if (!lyric_text.empty()) {
+        local_lyric_text = std::move(lyric_text);
+        ESP_LOGI(TAG, "使用直接歌词文本，长度=%d bytes", (int)local_lyric_text.size());
+    } else if (!lyric_url.empty()) {
         ESP_LOGI(TAG, "正在拉取歌词: %s", lyric_url.c_str());
-
-        std::string lyric_text;
-        bool lyric_ready = false;
 
         if (lyric_url.rfind("/sdcard/", 0) == 0) {
             // 本地歌词文件：直接读盘
@@ -1467,18 +1498,16 @@ void Application::MusicPlaybackTask(std::string url, std::string title, std::str
                 char chunk[512];
                 size_t got = 0;
                 while ((got = fread(chunk, 1, sizeof(chunk), lrc_file)) > 0) {
-                    lyric_text.append(chunk, got);
+                    local_lyric_text.append(chunk, got);
                 }
                 fclose(lrc_file);
-                lyric_ready = !lyric_text.empty();
             }
         } else {
             auto lyric_http = network->CreateHttp(4);  // 用不同的 connect_id，避免和音乐流(3)的 TLS 连接冲突
             lyric_http->SetHeader("User-Agent", SystemInfo::GetUserAgent());
             if (lyric_http->Open("GET", lyric_url)) {
                 if (lyric_http->GetStatusCode() == 200) {
-                    lyric_text = lyric_http->ReadAll();
-                    lyric_ready = !lyric_text.empty();
+                    local_lyric_text = lyric_http->ReadAll();
                 } else {
                     ESP_LOGW(TAG, "歌词拉取失败，HTTP 状态码: %d", lyric_http->GetStatusCode());
                 }
@@ -1487,71 +1516,92 @@ void Application::MusicPlaybackTask(std::string url, std::string title, std::str
                 ESP_LOGW(TAG, "歌词拉取失败：无法连接到歌词服务");
             }
         }
-
-        if (lyric_ready) {
-                    ESP_LOGI(TAG, "歌词拉取成功，长度=%d bytes", (int)lyric_text.size());
-
-                    // 解析 LRC 歌词：逐行提取 [mm:ss.xx] 时间戳和纯文本
-                    size_t pos = 0;
-                    while (pos < lyric_text.size()) {
-                        // 找到行尾
-                        size_t line_end = lyric_text.find('\n', pos);
-                        if (line_end == std::string::npos) line_end = lyric_text.size();
-                        std::string line = lyric_text.substr(pos, line_end - pos);
-                        pos = line_end + 1;
-
-                        // 去掉行尾 \r
-                        if (!line.empty() && line.back() == '\r') line.pop_back();
-                        if (line.empty()) continue;
-
-                        // 提取所有时间标签 [mm:ss.xx] 或 [mm:ss.xxx]
-                        std::string pure_text;
-                        std::vector<uint32_t> timestamps;
-                        size_t i = 0;
-                        while (i < line.size() && line[i] == '[') {
-                            size_t close = line.find(']', i);
-                            if (close == std::string::npos) break;
-                            std::string tag = line.substr(i + 1, close - i - 1);
-                            i = close + 1;
-
-                            // 尝试解析时间 mm:ss.xx
-                            int mm = 0, ss = 0, ms = 0;
-                            if (sscanf(tag.c_str(), "%d:%d.%d", &mm, &ss, &ms) >= 2) {
-                                // 处理毫秒位数：.27 → 270ms, .270 → 270ms, .5 → 500ms
-                                if (ms < 10 && tag.find('.') != std::string::npos) {
-                                    size_t dot = tag.find('.');
-                                    size_t ms_digits = tag.size() - dot - 1;
-                                    if (ms_digits == 1) ms *= 100;
-                                    else if (ms_digits == 2) ms *= 10;
-                                }
-                                timestamps.push_back(mm * 60000 + ss * 1000 + ms);
-                            }
-                            // 非时间标签（如 [ti:标题]）直接跳过
-                        }
-                        pure_text = line.substr(i);
-
-                        // 跳过空歌词和元信息行
-                        if (pure_text.empty()) continue;
-
-                        // 每个时间戳对应同一句歌词
-                        for (uint32_t ts : timestamps) {
-                            lyrics.push_back({ts, pure_text});
-                        }
-                    }
-
-                    // 按时间排序
-                    std::sort(lyrics.begin(), lyrics.end(),
-                              [](const LyricLine& a, const LyricLine& b) { return a.time_ms < b.time_ms; });
-                    if (!lyrics.empty()) {
-                        lyric_total_ms = std::max<uint32_t>(lyrics.back().time_ms, 1);
-                    }
-
-                    ESP_LOGI(TAG, "LRC 歌词解析完成，共 %d 行有效歌词", (int)lyrics.size());
-        } else {
-            ESP_LOGW(TAG, "歌词内容为空");
-        }
     }
-    constexpr int kReadBufSize = 2048;
+
+    if (!local_lyric_text.empty()) {
+        // 解析 LRC 歌词：逐行提取 [mm:ss.xx] / 【mm:ss.xx】时间戳和纯文本。
+        // 兼容全角【】：有些歌词源（尤其翻译歌词）用全角方括号，只认半角会把
+        // "【00:29.34】故事的小黄..." 整个当正文显示出来。
+        size_t pos = 0;
+        while (pos < local_lyric_text.size()) {
+            size_t line_end = local_lyric_text.find('\n', pos);
+            if (line_end == std::string::npos) line_end = local_lyric_text.size();
+            std::string line = local_lyric_text.substr(pos, line_end - pos);
+            pos = line_end + 1;
+
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty()) continue;
+
+            std::string pure_text;
+            std::vector<uint32_t> timestamps;
+            size_t i = 0;
+            // 逐段吃掉时间标签：支持半角 [ 与全角 【（以及对应的 ] / 】）
+            while (i < line.size()) {
+                const unsigned char open = line[i];
+                if (open != '[' && open != 0xE3) break;   // 0xE3 是全角【 的首字节（UTF-8 0xE3 0x80 0x90）
+
+                size_t close_pos = std::string::npos;
+                if (open == '[') {
+                    close_pos = line.find(']', i);
+                } else {
+                    // 全角【：找 】（UTF-8 0xE3 0x80 0x91）
+                    close_pos = line.find("\xE3\x80\x91", i);
+                }
+                if (close_pos == std::string::npos) break;
+
+                size_t tag_start = (open == '[') ? i + 1 : i + 3;   // 跳过 【 的 3 字节
+                std::string tag = line.substr(tag_start, close_pos - tag_start);
+                i = (open == '[') ? close_pos + 1 : close_pos + 3;  // 跳过 】 的 3 字节
+
+                // 尝试解析时间 mm:ss.xx
+                int mm = 0, ss = 0, ms = 0;
+                if (sscanf(tag.c_str(), "%d:%d.%d", &mm, &ss, &ms) >= 2) {
+                    // 小数点后的数字要按"位数"换算成毫秒，而不是按数值大小：
+                    //   [00:29.3]   → 1 位 = 十分之一秒 → 300ms
+                    //   [00:29.34]  → 2 位 = 百分之一秒 → 340ms
+                    //   [00:29.345] → 3 位 = 毫秒       → 345ms
+                    //
+                    // 以前写的是 "ms < 10 才换算"，于是 .34 被当成 34ms，
+                    // 每句歌词时间戳少了约 300ms，和歌声对不上（歌词偏早）。
+                    const size_t dot = tag.find('.');
+                    if (dot != std::string::npos && dot + 1 < tag.size()) {
+                        const size_t ms_digits = tag.size() - dot - 1;
+                        if (ms_digits == 1) {
+                            ms *= 100;
+                        } else if (ms_digits == 2) {
+                            ms *= 10;
+                        }
+                        // 3 位及以上：sscanf 出来的已经是毫秒，不用动
+                    }
+                    timestamps.push_back(mm * 60000 + ss * 1000 + ms);
+                }
+                // 非时间标签（[ti:标题]）跳过，继续看后面还有没有时间戳
+            }
+            pure_text = line.substr(i);
+
+            if (pure_text.empty()) continue;
+
+            // 去掉正文里可能残留的全角/半角空白
+            for (uint32_t ts : timestamps) {
+                lyrics.push_back({ts, pure_text});
+            }
+        }
+
+        std::sort(lyrics.begin(), lyrics.end(),
+                  [](const LyricLine& a, const LyricLine& b) { return a.time_ms < b.time_ms; });
+        if (!lyrics.empty()) {
+            lyric_total_ms = std::max<uint32_t>(lyrics.back().time_ms, 1);
+        }
+        ESP_LOGI(TAG, "LRC 歌词解析完成，共 %d 行有效歌词", (int)lyrics.size());
+    }
+
+    // ===== 专辑封面：已放弃（改成唱片中心显示"小智"标识）=====
+    // 网易云封面图 100KB+、原图 1000×1000，下载 + RGB888 解码要占大量 PSRAM，
+    // 和音频流抢内存，解码失败还会静默无显示。改成内置"小智"标签后，
+    // 这里不再拉图，省掉网络请求和解码开销，也让播放更稳。
+    (void)cover;
+
+    constexpr int kReadBufSize = 8192;
     int out_buf_size = 8192;
     bool decoder_registered = false;
     bool playback_finished = false;
@@ -1562,6 +1612,7 @@ void Application::MusicPlaybackTask(std::string url, std::string title, std::str
     esp_ae_rate_cvt_handle_t music_resampler = nullptr;
     uint8_t* in_buf = nullptr;
     uint8_t* out_buf = nullptr;
+    int16_t* pcm_work_buf = nullptr;   // 热循环复用：声道转换/重采样工作区（内部 RAM）
     bool info_ready = false;
     int stream_sample_rate = codec->output_sample_rate();
     int stream_channels = codec->output_channels();
@@ -1575,6 +1626,9 @@ void Application::MusicPlaybackTask(std::string url, std::string title, std::str
     size_t total_output_samples = 0;
 
     auto http = network->CreateHttp(3);
+    // 音频流连接设 12 秒超时：网易云 m701/m801 旧服务器偶发慢，默认超时太久会让
+    // 用户干等；12 秒内连不上就走下面的重试，而不是一直卡着。
+    http->SetTimeout(12000);
     do {
         if (is_local) {
             local_file = fopen(local_path.c_str(), "rb");
@@ -1597,7 +1651,21 @@ void Application::MusicPlaybackTask(std::string url, std::string title, std::str
         } else {
         http->SetHeader("User-Agent", SystemInfo::GetUserAgent());
 
-        if (!http->Open("GET", url)) {
+        // 音频流连接重试：网易云旧服务器偶发握手慢/超时，连不上就重试两次，
+        // 每次重新 Open（CreateHttp 的连接可能已坏，重试前重建一次）。
+        bool opened = false;
+        for (int attempt = 0; attempt < 3 && !opened; ++attempt) {
+            if (attempt > 0) {
+                ESP_LOGW(TAG, "音频流连接失败，第 %d 次重试...", attempt);
+                vTaskDelay(pdMS_TO_TICKS(500));
+                http = network->CreateHttp(3);
+                http->SetTimeout(12000);
+                http->SetHeader("User-Agent", SystemInfo::GetUserAgent());
+            }
+            opened = http->Open("GET", url);
+        }
+
+        if (!opened) {
             ESP_LOGE(TAG, "播放音乐失败：无法打开 URL: %s", url.c_str());
             playback_failed = true;
             Schedule([display]() {
@@ -1654,13 +1722,30 @@ void Application::MusicPlaybackTask(std::string url, std::string title, std::str
             codec->EnableOutput(true);
         }
 
-        // 压缩流读缓冲：只被 CPU 读，放 PSRAM 完全没副作用
+        // 压缩流读缓冲：放 PSRAM。
+        // 曾经挪到内部 RAM 想减少卡顿，但 8KB 内部 RAM 挤掉了 AFE 的余量，
+        // 导致放歌时唤不醒 AI。PSRAM 80MHz 顺序读 8KB 只要约 100µs，
+        // 对音频实时性影响远小于"语音功能失效"。
         in_buf = static_cast<uint8_t*>(heap_caps_malloc(kReadBufSize, MALLOC_CAP_SPIRAM));
+        if (in_buf == nullptr) {
+            ESP_LOGW(TAG, "音频读缓冲 PSRAM 分配失败，回退内部 RAM");
+            in_buf = static_cast<uint8_t*>(heap_caps_malloc(kReadBufSize, MALLOC_CAP_8BIT));
+        }
         // 解码后的 PCM 缓冲：它要直接喂给 I2S DMA，留在内部 RAM。
         // 这不是偷懒——PSRAM 走 cache，一旦和 LVGL 刷新抢带宽就可能欠载爆音，
         // 换来的是 8KB 内部 RAM，不值得。
         out_buf = static_cast<uint8_t*>(heap_caps_malloc(out_buf_size, MALLOC_CAP_8BIT));
-        if (in_buf == nullptr || out_buf == nullptr) {
+        // PCM 工作缓冲：热循环里声道转换/重采样都要用，预分配好反复复用，
+        // 避免每解码一块就 new/delete 一个 vector 造成堆抖动 + 卡顿。
+        //
+        // 大小只需要装下"最大单声道采样数"：
+        //   out_buf 8KB = 4096 个 int16 采样；双声道→单声道后是 2048，
+        //   升采样（22050→24000）最多到 ~2233，8KB（4096 采样）足够。
+        // 以前按 out_buf_size * 2 = 16KB 分配，白白多占 8KB 内部 RAM，
+        // 而这块内存正是 AFE 做唤醒词检测要用的。
+        pcm_work_buf = static_cast<int16_t*>(heap_caps_malloc(
+            static_cast<size_t>(out_buf_size), MALLOC_CAP_8BIT));
+        if (in_buf == nullptr || out_buf == nullptr || pcm_work_buf == nullptr) {
             ESP_LOGE(TAG, "内存不足，无法播放音乐");
             playback_failed = true;
             break;
@@ -1748,26 +1833,34 @@ void Application::MusicPlaybackTask(std::string url, std::string title, std::str
                 }
 
                 if (out.decoded_size > 0) {
-                    std::vector<int16_t> pcm(out.decoded_size / sizeof(int16_t));
-                    memcpy(pcm.data(), out.buffer, out.decoded_size);
+                    // 热循环里不再每块 new vector（原来这里 new 一次 + memcpy 一次，
+                    // 声道/重采样又各 new 一次，是放歌卡顿的主因之一）。
+                    // 统一复用 pcm_work_buf，直接在原地做声道转换和重采样。
+                    size_t pcm_samples = out.decoded_size / sizeof(int16_t);
+                    int16_t* pcm_ptr = reinterpret_cast<int16_t*>(out.buffer);
 
                     // 先做声道转换，统一到 codec 输出声道数。
                     if (stream_channels == 2 && codec->output_channels() == 1) {
-                        std::vector<int16_t> mono(pcm.size() / 2);
-                        for (size_t i = 0, j = 0; i < mono.size(); ++i, j += 2) {
-                            mono[i] = static_cast<int16_t>((static_cast<int32_t>(pcm[j]) + static_cast<int32_t>(pcm[j + 1])) / 2);
+                        // 双声道 → 单声道：两两平均，写进工作缓冲
+                        const size_t mono_samples = pcm_samples / 2;
+                        for (size_t i = 0, j = 0; i < mono_samples; ++i, j += 2) {
+                            pcm_work_buf[i] = static_cast<int16_t>(
+                                (static_cast<int32_t>(pcm_ptr[j]) + static_cast<int32_t>(pcm_ptr[j + 1])) / 2);
                         }
-                        pcm = std::move(mono);
+                        pcm_ptr = pcm_work_buf;
+                        pcm_samples = mono_samples;
                     } else if (stream_channels == 1 && codec->output_channels() == 2) {
-                        std::vector<int16_t> stereo(pcm.size() * 2);
-                        for (size_t i = 0; i < pcm.size(); ++i) {
-                            stereo[i * 2] = pcm[i];
-                            stereo[i * 2 + 1] = pcm[i];
+                        // 单声道 → 双声道：每个采样复制一份
+                        const size_t stereo_samples = pcm_samples * 2;
+                        for (size_t i = 0; i < pcm_samples; ++i) {
+                            pcm_work_buf[i * 2] = pcm_ptr[i];
+                            pcm_work_buf[i * 2 + 1] = pcm_ptr[i];
                         }
-                        pcm = std::move(stereo);
+                        pcm_ptr = pcm_work_buf;
+                        pcm_samples = stereo_samples;
                     }
 
-                    // 采样率不一致时重采样，避免“变速/变调”问题。
+                    // 采样率不一致时重采样，避免"变速/变调"问题。
                     if (stream_sample_rate != codec->output_sample_rate()) {
                         if (music_resampler == nullptr) {
                             esp_ae_rate_cvt_cfg_t cfg = {
@@ -1785,30 +1878,43 @@ void Application::MusicPlaybackTask(std::string url, std::string title, std::str
                                 break;
                             }
                         }
-                        uint32_t in_samples = static_cast<uint32_t>(pcm.size() / codec->output_channels());
+                        const uint32_t in_samples = static_cast<uint32_t>(pcm_samples / codec->output_channels());
                         uint32_t out_samples = 0;
                         esp_ae_rate_cvt_get_max_out_sample_num(music_resampler, in_samples, &out_samples);
-                        std::vector<int16_t> resampled(out_samples * codec->output_channels());
+
+                        // 容量保护：pcm_work_buf 按 out_buf_size 字节分配，
+                        // 每声道样本数 = 字节数 / 2。升采样（如 8kHz→24kHz 三倍）
+                        // 时 out_samples 可能超出容量，必须截断，否则写越界会踩坏堆。
+                        // 正常的 44.1k/48k → 24k 都是降采样，不会触发。
+                        const uint32_t work_capacity =
+                            static_cast<uint32_t>(out_buf_size) / static_cast<uint32_t>(sizeof(int16_t));
                         uint32_t actual_out = out_samples;
+                        if (actual_out > work_capacity) {
+                            ESP_LOGW(TAG, "重采样输出 %u 超过工作缓冲 %u，截断（音质略降）",
+                                     static_cast<unsigned>(actual_out),
+                                     static_cast<unsigned>(work_capacity));
+                            actual_out = work_capacity;
+                        }
                         esp_ae_rate_cvt_process(
                             music_resampler,
-                            reinterpret_cast<esp_ae_sample_t>(pcm.data()),
+                            reinterpret_cast<esp_ae_sample_t>(pcm_ptr),
                             in_samples,
-                            reinterpret_cast<esp_ae_sample_t>(resampled.data()),
+                            reinterpret_cast<esp_ae_sample_t>(pcm_work_buf),
                             &actual_out);
-                        resampled.resize(actual_out * codec->output_channels());
-                        pcm = std::move(resampled);
+                        pcm_ptr = pcm_work_buf;
+                        pcm_samples = static_cast<size_t>(actual_out) * codec->output_channels();
                     }
 
-                    if (!pcm.empty()) {
-                        total_output_samples += pcm.size();
+                    if (pcm_samples > 0) {
+                        total_output_samples += pcm_samples;
                         // 快进：目标位置之前的采样只解码、不出声，也不刷进度
                         if (total_output_samples > skip_samples) {
                             // 音乐播放绕过了 AudioService，需要手动保持功放开启。
                             if (!codec->output_enabled()) {
                                 codec->EnableOutput(true);
                             }
-                            codec->OutputData(pcm);
+                            // 裸指针版 OutputData：复用工作缓冲，省掉 vector 包装 + memcpy
+                            codec->OutputData(pcm_ptr, static_cast<int>(pcm_samples));
 
                             // 计算当前播放位置（无论有没有歌词都需要）
                             uint32_t current_ms = static_cast<uint32_t>(
@@ -1817,8 +1923,12 @@ void Application::MusicPlaybackTask(std::string url, std::string title, std::str
 
                             // 同步更新原子变量，供 MCP 工具查询当前进度
                             music_progress_ms_.store(current_ms);
-                            // 时长优先用文件头算出来的真实值，没有就用歌词末尾时间戳
-                            track_total_ms = (measured_total_ms > 0) ? measured_total_ms : lyric_total_ms;
+                            // 时长优先级：中转给的 duration_ms > 本地文件头算的 > 歌词末尾时间戳
+                            if (duration_ms > 0) {
+                                track_total_ms = duration_ms;
+                            } else {
+                                track_total_ms = (measured_total_ms > 0) ? measured_total_ms : lyric_total_ms;
+                            }
                             if (track_total_ms > 0) {
                                 music_total_ms_.store(track_total_ms);
                             }
@@ -1867,6 +1977,9 @@ void Application::MusicPlaybackTask(std::string url, std::string title, std::str
     }
     if (out_buf != nullptr) {
         heap_caps_free(out_buf);
+    }
+    if (pcm_work_buf != nullptr) {
+        heap_caps_free(pcm_work_buf);
     }
     if (decoder != nullptr) {
         esp_audio_simple_dec_close(decoder);

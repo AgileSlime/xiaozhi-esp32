@@ -23,8 +23,10 @@
 #include "managers/reminder_manager.h"
 #include "managers/music_library.h"
 #include "managers/music_stream.h"
+#include "managers/music_relay_discovery.h"
 #include "managers/photo_loader.h"
 #include "managers/photo_web_server.h"
+#include "serial_console.h"
 
 // 声明小智字体（用于系统信息显示时临时切换字体大小）
 LV_FONT_DECLARE(font_puhui_14_1);
@@ -739,7 +741,9 @@ private:
 
                 auto& app = Application::GetInstance();
                 if (!app.PlayMusicFromUrl(resolved.url, resolved.song.title,
-                                          resolved.song.artist, resolved.lyric)) {
+                                          resolved.song.artist, resolved.lyric, "",
+                                          0, false, static_cast<uint32_t>(resolved.song.duration_ms),
+                                          resolved.cover)) {
                     return std::string("找到歌了，但播放没启动（刚播过同一首会这样，隔几秒再说一次）");
                 }
                 return "正在播放《" + resolved.song.title + "》— " + resolved.song.artist;
@@ -792,16 +796,25 @@ private:
 
         // ===== 对话记录 =====
         mcp_server.AddTool("self.chat.history",
-            "Show the recent conversation (what the user said and what you answered) on screen.\n"
-            "Use when user says: '看看聊天记录', '刚才说了什么', '对话记录', 'chat history'",
-            PropertyList(),
-            [this](const PropertyList&) -> ReturnValue {
+            "Zoom the conversation into a full-screen view, or shrink it back to the small card.\n"
+            "Each page already has its own small chat card that appears while listening/answering;\n"
+            "this tool is ONLY for the user's explicit \"enlarge / zoom / show full list\" request.\n"
+            "Use `show=true` when user says: '放大对话列表', '展开对话', '看完整聊天记录', '对话记录全屏'.\n"
+            "Use `show=false` when user says: '收起对话', '缩小对话', '关掉对话列表'.",
+            PropertyList({
+                Property("show", kPropertyTypeBoolean, true)
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
                 if (!display_) {
                     return std::string("屏幕还没准备好");
                 }
+                bool show = true;
+                try { show = properties["show"].value<bool>(); } catch (...) { show = true; }
+
                 display_->NotifyUserActivity();
-                display_->SetChatOverlayVisible(true);
-                return std::string("最近几轮对话已经显示在屏幕上了");
+                display_->SetChatOverlayVisible(show);
+                return show ? std::string("已经把对话记录放大到全屏了")
+                            : std::string("已收起，回到刚才那一页");
             });
 
         // ===== 语音播放控制：播放/暂停、上下一首、快进 =====
@@ -913,6 +926,14 @@ private:
     }
 
     void InitializeLcdDisplay() {
+        // 关键：必须在构造 CustomLcdDisplay 之前先把 NVS 里的常驻壁纸读进来。
+        // 原因：构造函数里的 SetupWeatherUI 会"首帧铺默认图"（LoadDefault），
+        // 如果 override 还没加载，屏幕就先显示了内置默认图；之后即使 override
+        // 读进来，也要等 data_update_task 再 LoadHomePhoto 一次才换回来，中间
+        // 会一直停在默认图（尤其断网时 data_update_task 可能被别的事拖住）。
+        // 提前读好，让 SetupWeatherUI 能直接判断"有 override 就跳过默认图"。
+        HomePhoto::GetInstance().LoadSavedOverride();
+
         spi_display_config_t spi_config = {};
         spi_config.mosi = RLCD_MOSI_PIN;
         spi_config.scl = RLCD_SCK_PIN;
@@ -932,8 +953,9 @@ private:
                 return;
             }
             // "ram:upload" = 一次性图片，已经在内存里抖动好了，直接重新摊到照片位。
+            // "ram:reset"  = 用户把常驻壁纸删了，重新按 SD 卡 / 内置图挑一张。
             // 不走 Rescan：没有写 SD 卡，目录扫描反而会把这次上传覆盖掉。
-            if (path == "ram:upload") {
+            if (path == "ram:upload" || path == "ram:reset") {
                 display_->SwitchToWeatherPage();
                 display_->LoadHomePhoto(-1);
                 return;
@@ -943,6 +965,13 @@ private:
             const int idx = photo.IndexOf(path);
             display_->LoadHomePhoto(idx >= 0 ? idx : -1);
         });
+
+        // 串口命令通道：插上 USB，电脑那边就能发命令控制板子（play / relay / page ...）
+        SerialConsole::GetInstance().Start(display_);
+
+        // 中转地址自动发现：电脑上的 relay.py 广播自己在哪，板子自动记下来，
+        // 不用再对着设备念 IP。
+        MusicRelayDiscovery::GetInstance().Start();
     }
 
     // 启动后台服务：时钟任务 + 提醒任务
@@ -966,7 +995,14 @@ private:
                 if (display != nullptr) {
                     display->SwitchToWeatherPage();
                 }
-                app.Alert("提醒", buf, "happy", Lang::Sounds::OGG_POPUP);
+                // 闹钟只"叮"一声太容易被忽略（尤其正在放歌时），改成连响 3 次。
+                // 用 exclamation（比 popup 更明显）——这是闹钟，要吵醒人才对。
+                // Schedule 跑在主任务里，这里循环会占住主任务几秒，
+                // 但提醒本来就是最高优先级的动作，可以接受。
+                for (int i = 0; i < 3; ++i) {
+                    app.Alert("提醒", buf, "happy", Lang::Sounds::OGG_EXCLAMATION);
+                    vTaskDelay(pdMS_TO_TICKS(1200));
+                }
             });
         });
 

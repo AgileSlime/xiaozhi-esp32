@@ -115,7 +115,8 @@ public:
     void PlaySound(const std::string_view& sound);
     bool PlayMusicFromUrl(const std::string& url, const std::string& title, const std::string& artist,
                           const std::string& lyric, const std::string& lyric_url = "",
-                          uint32_t start_ms = 0, bool force = false);
+                          uint32_t start_ms = 0, bool force = false, uint32_t duration_ms = 0,
+                          const std::string& cover = "");
     void StopMusicPlayback(bool clear_lyric = true);
 
     // ===== 播放控制（语音 → MCP 工具 → 这里）=====
@@ -202,7 +203,9 @@ private:
     void ShowActivationCode(const std::string& code, const std::string& message);
     void SetListeningMode(ListeningMode mode);
     void MusicPlaybackTask(std::string url, std::string title, std::string artist,
-                           std::string lyric_url = "", uint32_t start_ms = 0);
+                           std::string lyric_url = "", std::string lyric_text = "",
+                           uint32_t start_ms = 0, uint32_t duration_ms = 0,
+                           std::string cover = "");
     
     // State change handler called by state machine
     void OnStateChanged(DeviceState old_state, DeviceState new_state);

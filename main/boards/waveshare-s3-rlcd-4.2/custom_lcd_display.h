@@ -24,11 +24,17 @@
 //   - 空闲态：最近 3 条要响的提醒，最近一条反白高亮
 //   - 语音态：聆听/回答标签 + 用户识别文字（反白块）+ AI 回复
 //
+// 对话记录：每个页面都有一张自己的"小对话卡"，就长在本页版式里
+// （天气页右下 158×142 / 备忘录页列表卡原位 376×214 / 播放器页右栏 208×160），
+// 都是"平时藏起来、聆听和回答时出现"，页面本来的内容在其余时间照旧。
+// 只有用户明确说「放大对话列表」时才展开成全屏的 chat_overlay_。
+//
 // 代码拆分为多个文件：
 //   rlcd_driver.h/cc      - RLCD 硬件驱动层（SPI、像素映射、初始化命令）
 //   weather_ui.cc          - 天气站 UI 布局（SetupWeatherUI）
 //   memo_ui.cc             - 备忘录/闹钟目录页（SetupMemoUI + 分页刷新）
 //   music_ui.cc            - 音乐页 UI 布局（SetupMusicUI）
+//   chat_ui.cc             - 三页的对话小卡 + 可放大的对话记录层
 //   data_update_task.cc    - 后台数据更新任务（时间/天气/传感器/电池/WiFi/AI状态）
 //   custom_lcd_display.cc  - 核心类（构造/析构/AI适配/备忘录/基类重写）
 class CustomLcdDisplay : public LcdDisplay {
@@ -84,7 +90,9 @@ private:
     lv_obj_t *music_artist_label_ = nullptr;  // 音乐页面：歌手
 
     // ===== 音乐页面（400x300，唱片 + 歌词 + 控制 + 进度）=====
-    lv_obj_t *music_disc_ = nullptr;                    // 唱片圆盘
+    lv_obj_t *music_disc_ = nullptr;                    // 唱片圆盘（外围黑胶 + 纹路 + 指示点，静态不转）
+    lv_obj_t *music_disc_label_ = nullptr;              // 中心 AI 头像底座（白圆）
+    lv_obj_t *music_ai_avatar_ = nullptr;               // 中心头像图（服务端 emoji，官网可换）
     lv_obj_t *music_pip_[3] = {nullptr, nullptr, nullptr};  // 唱片上的旋转指示点
     lv_obj_t *music_lyric_cont_ = nullptr;              // 歌词容器（整体上下滚动）
     lv_obj_t *music_lyric_line_[3] = {nullptr, nullptr, nullptr};  // 3 行歌词（上/当前/下）
@@ -112,6 +120,7 @@ private:
     // 音乐页内部刷新
     void RedrawPlayIcon();                          // 重画播放/暂停图标
     void UpdateMusicPips();                         // 按角度摆放 3 个指示点
+    void SetMusicAvatar(const char* emotion);       // 中心头像：按服务端表情换图（官网可换）
     void UpdateMusicLyricLines(const char* lyric);  // 解析 4 行歌词 + 滚动动画
     static void MusicPipTimerCb(lv_timer_t* t);     // LVGL 定时器（跑在 LVGL 任务里，不用抢锁）
 
@@ -239,13 +248,39 @@ public:
     // 刷新右下角备忘录列表显示（从 NVS 读取后格式化显示）
     void RefreshMemoDisplay();           // 自动获取锁（外部调用用这个）
     void RefreshMemoDisplayInternal();   // 不获取锁（已持锁时用这个，避免死锁）
-    // ===== 对话浮层（覆盖在任意页面之上）=====
-    // 三个页面各有自己的版式，塞不下对话记录；但"说话时看不到自己和 AI 说了什么"
-    // 是实际使用中最别扭的一点。所以做成一层全屏覆盖：
-    //   进入聆听 → 自动浮上来（不管是天气页、备忘录页还是播放器页）
-    //   工具执行（放歌/翻目录/传图）→ 自动收起，把结果页让出来
-    //   空闲 12 秒 → 自动收起，回到原来的页面
-    //   说一句"看看聊天记录" → 随时手动调出来
+    // ===== 对话小卡（每页一张，语音态出现，平时让位给本页内容）=====
+    // 三页版式各不相同，所以每页给一块尺寸合适的"白纸片"，直接盖在本页最该看的位置：
+    //   天气页   → 沿用右下角 voice_card_（158×142，和提醒卡共用一格）
+    //   备忘录页 → 列表卡原位 376×214（盖住闹钟目录，说完还回来）
+    //   播放器页 → 白卡右栏 208×160（左边唱片照转，右边曲名歌词换成对话）
+    // 卡是不透明白底 + 后创建，所以盖住即隐藏，不需要挨个去藏本页控件。
+    // 用户说「放大对话列表」→ 才展开成全屏的 chat_overlay_。
+    struct PageChatWindow {
+        lv_obj_t *card = nullptr;
+        lv_obj_t *badge = nullptr;      // 黑胶囊：聆听中 / 回答中 / 连接中
+        lv_obj_t *badge_label = nullptr;
+        lv_obj_t *title = nullptr;      // 右上小字「对 话」
+        lv_obj_t *user_row[2] = {nullptr, nullptr};     // 用户话的反白条
+        lv_obj_t *user_label[2] = {nullptr, nullptr};
+        lv_obj_t *ai_label[2] = {nullptr, nullptr};
+        int max_user_chars = 16;        // 按卡宽算出来的截断长度
+        int max_ai_chars = 48;
+    };
+    PageChatWindow memo_chat_;
+    PageChatWindow music_chat_;
+    bool page_chat_visible_ = false;
+
+    void SetupPageChatWindow(PageChatWindow &win, lv_obj_t *parent,
+                             int x, int y, int width, int height,
+                             int badge_w, int turn_y0, int turn_gap,
+                             int user_h, int ai_h, bool with_tip);
+    void SetupPageChatWindows();                    // 三页各建一张（chat_ui.cc）
+    void RefreshPageChatWindowsInternal();          // 需已持锁
+    void SetPageChatWindowsVisibleInternal(bool show);  // 需已持锁
+
+    // ===== 放大的对话记录层（全屏覆盖）=====
+    // 平时绝不自己冒出来：只在用户说「放大对话列表」时铺满一屏（3 轮），
+    // 空闲 12 秒自动收回，或用户说「收起」立刻收。
     lv_obj_t *chat_overlay_ = nullptr;
     lv_obj_t *chat_overlay_time_ = nullptr;
     lv_obj_t *chat_overlay_badge_ = nullptr;
@@ -258,7 +293,11 @@ public:
     };
     std::vector<ChatTurn> chat_turns_;      // 最多保留 3 轮
     bool chat_overlay_visible_ = false;
+    bool chat_overlay_pinned_ = false;      // 用户明确要求放大过
     uint32_t chat_hide_at_ms_ = 0;          // 空闲多久后自动收起（0=不收）
+    // 全屏放大的对话记录：一旦这一轮话说完就立刻退，别一直挡着页面。
+    // 进入聆听/说话时置位，回到空闲时消费掉。
+    bool close_overlay_on_idle_ = false;
     bool tool_jumped_this_turn_ = false;    // 这一轮里有没有发生"工具跳页"
 
     void SetupChatOverlay();
@@ -266,9 +305,12 @@ public:
     void RefreshChatOverlayInternal();                               // 需已持锁
     void SetChatOverlayVisibleInternal(bool show);                   // 需已持锁
 
-    // 数据更新任务用的是这个：手动调出/收起
+    // 数据更新任务用的是这个：手动调出/收起（放大层）
     void SetChatOverlayVisible(bool show);
     bool IsChatOverlayVisible() const { return chat_overlay_visible_; }
+
+    // 数据更新任务每秒调一次：按设备状态决定三页小卡出不出
+    void UpdatePageChatWindows(int device_state);
 
     // 数据更新任务 > 0 表示"页面已经切走了，这一轮别再浮上来"
     bool ToolJumpedThisTurn() const { return tool_jumped_this_turn_; }

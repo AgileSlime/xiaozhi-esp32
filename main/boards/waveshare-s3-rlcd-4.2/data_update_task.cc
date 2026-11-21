@@ -28,10 +28,12 @@
 #include "application.h"
 #include "assets/lang_config.h"
 #include "board.h"
+#include "wifi_manager.h"
 #include "managers/clock_service.h"
 #include "managers/sensor_manager.h"
 #include "managers/weather_manager.h"
 #include "managers/photo_loader.h"
+#include "managers/photo_web_server.h"
 
 // 声明状态栏图标（本任务负责更新图标）
 LV_IMAGE_DECLARE(ui_img_wifi);
@@ -76,8 +78,25 @@ void CustomLcdDisplay::DataUpdateTask(void *arg) {
     // 等待一会让系统启动完成（SD 卡 / 音频 / WiFi 都在初始化）
     vTaskDelay(pdMS_TO_TICKS(3000));
 
-    // 主页美图：按"今年第几天"取模选一张，同一天重启不会跳图
+    // 主页美图：先立刻摊一张上屏（NVS 常驻图 / SD 卡图 / 内置默认图），
+    // 不等 WiFi。否则断网时这个调用被下面"等 WiFi 最多 15 秒"挡住，
+    // 屏幕会一直停在默认图——这就是"断网就变回默认图"的根因。
     self->LoadHomePhoto(-1);
+
+    // 图片上传服务：WiFi 一有地址就自动开。
+    // 以前只在用户说「打开图片上传」时才启动，于是直接拿手机开网页的人
+    // 只会看到"无法访问此网站"，看上去就是"上传坏了"。
+    for (int i = 0; i < 30 && WifiManager::GetInstance().GetIpAddress().empty(); i++) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    if (!WifiManager::GetInstance().GetIpAddress().empty()) {
+        auto& web = PhotoWebServer::GetInstance();
+        if (web.IsRunning() || web.Start()) {
+            ESP_LOGI(TAG, "图片上传服务已就绪: %s", web.GetUrl().c_str());
+        }
+    } else {
+        ESP_LOGW(TAG, "WiFi 还没拿到地址，图片上传服务暂不启动");
+    }
 
     // 初始化活动时间（系统启动算一次活动）
     self->last_activity_ms_ = xTaskGetTickCount() * portTICK_PERIOD_MS;
@@ -90,6 +109,17 @@ void CustomLcdDisplay::DataUpdateTask(void *arg) {
         const bool in_audio_session = (ds == kDeviceStateConnecting ||
                                        ds == kDeviceStateListening ||
                                        ds == kDeviceStateSpeaking);
+
+        // ===== 网页闲置后把 WiFi 还回省电 =====
+        // 有网页在访问时 photo_web_server 会把 WiFi 拉到 PERFORMANCE，
+        // 否则省电模式下每个请求要白等一轮 1.02 秒的 DTIM，页面根本开不出来。
+        // 反过来，这里负责在没人访问时收回——但只在设备真的空闲时收，
+        // 正在对话或放歌的时候降射频会直接把声音卡出爆音。
+        if (PhotoWebServer::GetInstance().WifiBoosted() &&
+            !PhotoWebServer::GetInstance().IsActiveWindow() &&
+            ds == kDeviceStateIdle && !app.IsMusicPlaying()) {
+            PhotoWebServer::GetInstance().ReleaseWifiBoost();
+        }
 
         // ===== 时间（只读快照，不做任何同步动作）=====
         const ClockTick tick = ClockService::GetInstance().Snapshot();
@@ -148,8 +178,9 @@ void CustomLcdDisplay::DataUpdateTask(void *arg) {
                     }
                 }
 
-                // 3. 天气：新版主页版式（图片 + 时间 + 提醒）里没有天气的位置，
-                //    这里不再写 UI；WeatherManager 后台仍会拉数据，等以后有位置再显示。
+                // 3. 天气：主页版式（图片 + 时间 + 提醒）里没有天气的位置，
+                //    这里不写 UI；天气数据仍可由 MCP 工具 self.weather.update 写入，
+                //    需要展示时再找地方。
 
                 // 4. 电池状态更新（采样降频 + 变化更新）
                 auto& board = Board::GetInstance();
@@ -309,16 +340,32 @@ void CustomLcdDisplay::DataUpdateTask(void *arg) {
         // 内部有状态去重，重复调用不会引起重绘
         self->UpdateHomeBottomCard(static_cast<int>(ds));
 
-        // ===== 对话浮层：聆听时浮起，空闲 12 秒后收起 =====
-        // 三页版式都塞不下对话记录，所以做成覆盖层；这里只管"什么时候收"。
-        // 工具跳页（放歌 / 翻目录）已经把浮层收掉了，这里不再抢，
-        // 否则用户刚看到播放器页就又被打回对话。
-        if (ds == kDeviceStateConnecting || ds == kDeviceStateListening) {
-            self->SetChatOverlayVisible(true);
-        } else if (ds == kDeviceStateIdle && self->chat_overlay_visible_) {
-            const uint32_t hide_at = self->chat_hide_at_ms_;
-            if (hide_at != 0 && now_ms >= hide_at) {
-                self->SetChatOverlayVisible(false);
+        // ===== 对话显示：每页一张小卡（语音态出现，空闲立刻收回）=====
+        // 三页的小卡都长在本页版式里，不覆盖全屏；工具跳页那一轮自动让位。
+        self->UpdatePageChatWindows(static_cast<int>(ds));
+
+        // ===== 全屏放大的对话记录 =====
+        // 它只在"话说完之前"有意义。以前是闲置 12 秒才收，实际用起来就是：
+        // 说完话一抬头，整屏还盖着对话，想看天气还得等十几秒。
+        // 现在改成——这一轮话一结束（回到空闲）立刻收，12 秒只作为兜底。
+        {
+            const bool in_session = (ds == kDeviceStateConnecting ||
+                                     ds == kDeviceStateListening ||
+                                     ds == kDeviceStateSpeaking);
+            if (in_session && self->chat_overlay_visible_) {
+                self->close_overlay_on_idle_ = true;
+            }
+            if (ds == kDeviceStateIdle && self->chat_overlay_visible_) {
+                if (self->close_overlay_on_idle_) {
+                    self->close_overlay_on_idle_ = false;
+                    self->SetChatOverlayVisible(false);
+                    ESP_LOGI(TAG, "这一轮对话结束，全屏对话记录自动收起");
+                } else {
+                    const uint32_t hide_at = self->chat_hide_at_ms_;
+                    if (hide_at != 0 && now_ms >= hide_at) {
+                        self->SetChatOverlayVisible(false);
+                    }
+                }
             }
         }
 

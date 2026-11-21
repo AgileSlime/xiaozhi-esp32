@@ -168,12 +168,24 @@ void CustomLcdDisplay::SetupWeatherUI() {
     // 否则开机前 3 秒会先闪一下这行字再被图片盖住。
     lv_obj_add_flag(photo_hint_label_, LV_OBJ_FLAG_HIDDEN);
 
-    // 首帧就直接铺上内置默认壁纸。
+    // 首帧就铺上图片：优先 NVS 常驻图（已在构造前 LoadSavedOverride），
+    // 没有 override 才用内置默认壁纸。
     // 这一句不碰 SD 卡（只展位图），所以不会把"未挂载 → 空列表"的状态写进
     // HomePhoto 的扫描缓存；3 秒后 data_update_task 再走正常流程，
     // 有卡有图就换成卡里的照片，没图就沿用这张。
-    if (HomePhoto::GetInstance().LoadDefault(photo_img_, kPhotoInnerW, kPhotoInnerH)) {
-        lv_obj_clear_flag(photo_img_, LV_OBJ_FLAG_HIDDEN);
+    {
+        auto& photo = HomePhoto::GetInstance();
+        bool shown = false;
+        if (photo.HasOverride()) {
+            // 有常驻图：直接按 override 渲染，别先闪默认图再换
+            shown = photo.Load(photo_img_, kPhotoInnerW, kPhotoInnerH, -1);
+        }
+        if (!shown) {
+            shown = photo.LoadDefault(photo_img_, kPhotoInnerW, kPhotoInnerH);
+        }
+        if (shown) {
+            lv_obj_clear_flag(photo_img_, LV_OBJ_FLAG_HIDDEN);
+        }
     }
 
     // ================= 右上：时间卡 =================

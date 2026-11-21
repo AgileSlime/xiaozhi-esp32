@@ -30,6 +30,10 @@
 // 本机没有触摸，控制区只是状态指示，操作全部靠语音。
 
 #include "custom_lcd_display.h"
+#include "lvgl_theme.h"          // 取服务端表情图（assets 分区，官网可换）
+#include "managers/avatar_loader.h"   // 唱片中心的自上传头像
+
+#include <font_awesome.h>
 
 #include <cmath>
 #include <cstdio>
@@ -45,6 +49,8 @@ LV_FONT_DECLARE(font_puhui_14_1);
 LV_FONT_DECLARE(font_puhui_16_4);
 // 20px 1bpp 子集，用于曲名与当前句歌词（缺字自动 fallback 到 16px 全量）
 LV_FONT_DECLARE(font_puhui_20_1);
+// 小智 AI 头像图标（唱片中心用）
+LV_FONT_DECLARE(font_awesome_30_4);
 
 LV_IMAGE_DECLARE(ui_img_battery_full);
 LV_IMAGE_DECLARE(ui_img_battery_medium);
@@ -95,7 +101,7 @@ constexpr int kLyricX = 152;      // 歌词容器左边（比 kColX 少 4，留�
 constexpr int kLyricY = 70;
 constexpr int kLyricLineH = 28;
 constexpr int kLyricTextX = 8;    // 文字相对容器左边距
-constexpr int kLyricMaxUnits = 20;
+constexpr int kLyricMaxUnits = 28;   // 16px 字 212px 宽 ≈ 13 汉字（26 单位），留余量
 
 // 控制（黑底上的白线，纯状态指示）
 constexpr int kCtrlY = 222;
@@ -180,6 +186,8 @@ void FillTriLeft(lv_obj_t *cv, int x0, int y0, int w, int h, lv_color_t color) {
 // UTF-8 安全截断，按"显示宽度"算而不是字符数：
 // 汉字算 2 个单位（约 20px），ASCII 算 1 个（约 10px）。
 // 这样中文歌词不会挤爆、英文歌词也不会被砍掉一半。
+// 注意：歌词要求完整显示，不再加省略号——超长交给 LVGL 的 WRAP 换行，
+// 这里只在极端情况（单句超长）下硬截断保护布局，且只截不补省略号。
 std::string ClampUtf8(const std::string &text, int max_units) {
     size_t i = 0;
     int used = 0;
@@ -211,7 +219,7 @@ std::string ClampUtf8(const std::string &text, int max_units) {
     if (cut == std::string::npos) {
         return text;
     }
-    return text.substr(0, cut) + "…";
+    return text.substr(0, cut);
 }
 
 // 实心小条（信号条、分隔线、进度轨道通用）
@@ -313,6 +321,9 @@ void CustomLcdDisplay::SetupMusicUI() {
     lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
     // ---- 左侧：黑唱片（白卡上的黑圆，纹路是 1px 白线）----
+    // 结构：外围唱片盘 music_disc_（含纹路 + 指示点，用 transform 旋转），
+    // 中心封面标签 music_disc_label_ 独立成兄弟对象，盖在盘上、不参与旋转。
+    // 这样视觉上"封面不动、外围唱片在转"，且中心纯色块不进入旋转的软件渲染。
     music_disc_ = lv_obj_create(card);
     lv_obj_set_pos(music_disc_, kDiscX, kDiscY);
     lv_obj_set_size(music_disc_, kDiscD, kDiscD);
@@ -332,31 +343,14 @@ void CustomLcdDisplay::SetupMusicUI() {
         lv_obj_remove_flag(ring, LV_OBJ_FLAG_SCROLLABLE);
     }
 
-    // 中心白标
-    lv_obj_t *label = lv_obj_create(music_disc_);
-    lv_obj_set_size(label, kLabelD, kLabelD);
-    lv_obj_center(label);
-    StylePlainBox(label, lv_color_white(), LV_OPA_COVER, LV_RADIUS_CIRCLE);
-    lv_obj_set_style_clip_corner(label, true, 0);
-
-    lv_obj_t *side = lv_label_create(label);
-    lv_obj_set_style_text_font(side, font_sm, 0);
-    lv_obj_set_style_text_color(side, lv_color_black(), 0);
-    lv_obj_set_style_text_align(side, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_width(side, kLabelD);
-    lv_obj_set_pos(side, 0, 11);
-    lv_label_set_text(side, "SIDE A");
-
-    // 中心轴孔
-    lv_obj_t *hole = lv_obj_create(label);
-    lv_obj_set_size(hole, 6, 6);
-    lv_obj_set_pos(hole, kLabelD / 2 - 3, 31);
-    StylePlainBox(hole, lv_color_black(), LV_OPA_COVER, LV_RADIUS_CIRCLE);
-
-    // 旋转指示点（3 个，120° 均布）
+    // 旋转指示点（3 个，120° 均布）——固定在 disc 上，随外围盘 transform 旋转
     for (int i = 0; i < 3; i++) {
         lv_obj_t *pip = lv_obj_create(music_disc_);
         lv_obj_set_size(pip, kPipD, kPipD);
+        const float a = static_cast<float>(i) * 2.0943951f;   // 120° 均布
+        const int px = static_cast<int>(kDiscR + kPipR * cosf(a) - kPipD / 2.0f);
+        const int py = static_cast<int>(kDiscR + kPipR * sinf(a) - kPipD / 2.0f);
+        lv_obj_set_pos(pip, px, py);
         StylePlainBox(pip, lv_color_white(), LV_OPA_COVER, LV_RADIUS_CIRCLE);
         // 1px 黑描边：白点跨在白色纹路上时，靠这圈黑边保住轮廓
         lv_obj_set_style_border_width(pip, 1, 0);
@@ -366,6 +360,45 @@ void CustomLcdDisplay::SetupMusicUI() {
     }
     music_pip_step_ = 10;
     UpdateMusicPips();
+
+    // ---- 中心封面标签：独立对象，盖在唱片盘上，不转 ----
+    // 坐标换算：disc 在 card 内 (kDiscX,kDiscY)，标签居中于 disc 圆心。
+    music_disc_label_ = lv_obj_create(card);
+    lv_obj_set_pos(music_disc_label_,
+                   kDiscX + (kDiscD - kLabelD) / 2,
+                   kDiscY + (kDiscD - kLabelD) / 2);
+    lv_obj_set_size(music_disc_label_, kLabelD, kLabelD);
+    StylePlainBox(music_disc_label_, lv_color_white(), LV_OPA_COVER, LV_RADIUS_CIRCLE);
+    lv_obj_set_style_clip_corner(music_disc_label_, true, 0);
+
+    // 中心：小智 AI 头像（跟随小智服务端下发的表情，官网可换表情包）
+    //
+    // 分两层叠：
+    //   底层  side     —— font_awesome 的 MICROCHIP_AI 图标，永远在，做兜底
+    //   上层  avatar   —— 服务端 emoji 图，拿到图就盖上去
+    // 这样即使 assets 里没有表情图，中心也不会空着。
+    lv_obj_t *side = lv_label_create(music_disc_label_);
+    lv_obj_set_style_text_font(side, &font_awesome_30_4, 0);
+    lv_obj_set_style_text_color(side, lv_color_black(), 0);
+    lv_obj_set_style_text_align(side, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(side, kLabelD);
+    lv_obj_center(side);
+    lv_label_set_text(side, FONT_AWESOME_MICROCHIP_AI);
+
+    // 上层：服务端表情图（圆形白底上叠一张 twemoji，透明区域露出白底）
+    music_ai_avatar_ = lv_image_create(music_disc_label_);
+    lv_obj_center(music_ai_avatar_);
+    lv_obj_add_flag(music_ai_avatar_, LV_OBJ_FLAG_HIDDEN);   // 等 SetEmotion 给了图再显示
+
+    // 中心轴孔（叠在头像之上，保留唱片的"轴心"感觉）
+    lv_obj_t *hole = lv_obj_create(music_disc_label_);
+    lv_obj_set_size(hole, 6, 6);
+    lv_obj_set_pos(hole, kLabelD / 2 - 3, 31);
+    StylePlainBox(hole, lv_color_black(), LV_OPA_COVER, LV_RADIUS_CIRCLE);
+
+    // 关键：唱片盘带 transform 旋转时，LVGL 可能把它当成独立渲染层盖住
+    // 后创建的中心标签。这里强制把中心提到最上层，确保 AI 头像一直可见。
+    lv_obj_move_foreground(music_disc_label_);
 
     // ---- 右侧：曲名 / 歌手 / 分隔线 ----
     music_title_label_ = lv_label_create(card);
@@ -394,20 +427,28 @@ void CustomLcdDisplay::SetupMusicUI() {
     lv_obj_set_style_clip_corner(music_lyric_cont_, true, 0);
 
     // 当前句的反白条：和备忘录页首行反白是同一个语言
+    // 注意必须用 LV_OPA_COVER —— 这里原来是 LV_OPA_TRANSP（全透明），
+    // 等于根本没画这条底衬；而当前句的文字是白色，白字落在白卡上就完全看不见，
+    // 表现就是"三行歌词只显示上下两句，中间那句空白"。
+    // 改成实心黑底后：当前句 = 黑底白字，上下句 = 白底黑字，才是真正反白。
     music_lyric_hl_ = lv_obj_create(music_lyric_cont_);
     lv_obj_set_pos(music_lyric_hl_, 0, kLyricLineH);
     lv_obj_set_size(music_lyric_hl_, kColW + 4, kLyricLineH);
-    StylePlainBox(music_lyric_hl_, lv_color_black(), LV_OPA_TRANSP, 8);
+    StylePlainBox(music_lyric_hl_, lv_color_black(), LV_OPA_COVER, 8);
     lv_obj_add_flag(music_lyric_hl_, LV_OBJ_FLAG_HIDDEN);
 
     for (int i = 0; i < 3; i++) {
         lv_obj_t *line = lv_label_create(music_lyric_cont_);
         const bool cur = (i == 1);
-        lv_obj_set_style_text_font(line, cur ? font_lg : font_cn, 0);
+        // 三行统一 16px：当前句靠反白条突出，不再用 20px 大字号。
+        // 20px 一行只能放 ~10 个汉字，大部分歌词被截断加省略号；
+        // 16px 一行能放 ~13 个汉字，配合 WRAP 换行基本能完整显示。
+        lv_obj_set_style_text_font(line, font_cn, 0);
         lv_obj_set_style_text_color(line, cur ? lv_color_white() : lv_color_black(), 0);
-        lv_obj_set_pos(line, kLyricTextX, i * kLyricLineH + (cur ? 3 : 5));
+        lv_obj_set_pos(line, kLyricTextX, i * kLyricLineH + 4);
         lv_obj_set_size(line, kColW + 4 - kLyricTextX, kLyricLineH - 2);
-        lv_label_set_long_mode(line, LV_LABEL_LONG_DOT);
+        // 完整显示：换行而不是省略号截断
+        lv_label_set_long_mode(line, LV_LABEL_LONG_WRAP);
         lv_label_set_text(line, "");
         music_lyric_line_[i] = line;
     }
@@ -486,11 +527,16 @@ void CustomLcdDisplay::SetupMusicUI() {
     music_emotion_img_ = lv_image_create(page);
     lv_obj_add_flag(music_emotion_img_, LV_OBJ_FLAG_HIDDEN);
 
-    // ================= 唱片转动定时器 =================
-    lv_timer_t *pip_timer = lv_timer_create(MusicPipTimerCb, 150, this);
-    if (pip_timer != nullptr) {
-        lv_timer_set_repeat_count(pip_timer, -1);
-    }
+    // 唱片旋转已去掉。
+    //
+    // 原来每 300ms 用 transform 旋转整块 132×132 的唱片，1-bit 屏上每次都要
+    // 整块重绘 + 重新抖动；和音频解码抢 CPU 时直接表现为放歌断断续续。
+    // 静态唱片视觉上并不差（本来就是"放着的唱片"），换来的是音频链路的余量。
+    // 如果以后想恢复，把下面两行注释打开即可。
+    //
+    // lv_timer_t *pip_timer = lv_timer_create(MusicPipTimerCb, 300, this);
+    // if (pip_timer != nullptr) lv_timer_set_repeat_count(pip_timer, -1);
+    UpdateMusicPips();   // 摆一次初始姿态（角度 0），之后不再动
 
     ESP_LOGI(TAG, "播放器页创建完成（唱片 %d / 歌词 3 行 / 进度 %d）", kDiscD, kBarW);
 }
@@ -500,19 +546,44 @@ void CustomLcdDisplay::SetupMusicUI() {
 // ============================================================
 
 void CustomLcdDisplay::UpdateMusicPips() {
-    if (music_pip_[0] == nullptr) {
+    if (music_disc_ == nullptr) {
         return;
     }
-    const float base = static_cast<float>(music_pip_angle_) * 3.14159265f / 180.0f;
-    for (int i = 0; i < 3; i++) {
-        const float a = base + static_cast<float>(i) * 2.0943951f;   // 120°
-        const int px = static_cast<int>(kDiscR + kPipR * cosf(a) - kPipD / 2.0f);
-        const int py = static_cast<int>(kDiscR + kPipR * sinf(a) - kPipD / 2.0f);
-        lv_obj_set_pos(music_pip_[i], px, py);
-    }
-    // 三个点分散在圆周上，LVGL 会拆成 6 个脏矩形 → 6 次整帧 SPI。
-    // 主动把整块唱片标脏，让它们合并成一次刷新，既省总线也不会在 DMA 传输中反复改同一块显存。
+    // 整个唱片用 transform 旋转：中心 SIDE A 标签、3 个指示点、纹路全跟着转，
+    // 视觉上就是"封面在转"。旋转中心（pivot）设在唱片圆心。
+    lv_obj_set_style_transform_pivot_x(music_disc_, kDiscR, 0);
+    lv_obj_set_style_transform_pivot_y(music_disc_, kDiscR, 0);
+    lv_obj_set_style_transform_rotation(music_disc_, music_pip_angle_, 0);
+    // transform 旋转会整块重绘，主动标脏一次即可，避免 3 个点各自拆脏矩形
     lv_obj_invalidate(music_disc_);
+}
+
+// 播放器页唱片中心的头像。
+//
+// 用自上传的 1-bit 头像（AvatarLoader），和主页壁纸同一套逻辑：
+//   JPEG → 灰度 → 抖动 → 52×52 1bpp → NVS，画什么就清晰什么。
+// 没上传过头像时退回 font_awesome 的黑白图标（下层对象）。
+//
+// 不走官网 emoji：彩色图在 1-bit 屏上只会剩下几个黑点，而且运行时缩放彩色图
+// 要吃内部 RAM，那是 AFE 唤醒词检测的命根子。
+void CustomLcdDisplay::SetMusicAvatar(const char* emotion) {
+    (void)emotion;   // 头像与情绪无关，保留参数是为了不动调用点
+    if (music_ai_avatar_ == nullptr) {
+        return;
+    }
+
+    const lv_img_dsc_t* dsc = AvatarLoader::GetInstance().Dsc();
+    if (dsc == nullptr) {
+        // 还没上传头像 → 露出下层的 font_awesome 图标
+        lv_obj_add_flag(music_ai_avatar_, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+
+    lv_image_set_src(music_ai_avatar_, dsc);
+    // 1:1 显示（52×52 正好填满头像底座），不缩放，保证像素级清晰
+    lv_image_set_scale(music_ai_avatar_, 256);
+    lv_obj_center(music_ai_avatar_);
+    lv_obj_clear_flag(music_ai_avatar_, LV_OBJ_FLAG_HIDDEN);
 }
 
 void CustomLcdDisplay::MusicPipTimerCb(lv_timer_t *t) {
@@ -636,18 +707,19 @@ void CustomLcdDisplay::UpdateMusicLyricLines(const char *lyric) {
 }
 
 void CustomLcdDisplay::SetMusicProgress(uint32_t current_ms, uint32_t total_ms) {
-    DisplayLockGuard lock(this);
-    if (music_bar_fill_ == nullptr || music_time_cur_ == nullptr) {
-        return;
-    }
-
-    // 播放任务每解码一块（~90ms）就调一次；这里按"秒"去重，
-    // 否则每秒会触发 10 多次整屏 SPI，1-bit 屏上看着就是闪。
+    // 关键：秒级去重必须放在抢锁之前。播放任务每解码一块（~90ms）就调一次，
+    // 如果每次都先抢 LVGL 锁再做判断，会跟唱片旋转/页面刷新的 LVGL 主线程
+    // 反复抢锁阻塞，导致 I2S 缓冲欠载爆音（放歌卡顿的元凶）。
     const int sec = static_cast<int>(current_ms / 1000);
     if (sec == music_last_sec_) {
         return;
     }
     music_last_sec_ = sec;
+
+    DisplayLockGuard lock(this);
+    if (music_bar_fill_ == nullptr || music_time_cur_ == nullptr) {
+        return;
+    }
 
     char buf[16];
     snprintf(buf, sizeof(buf), "%02u:%02u",
